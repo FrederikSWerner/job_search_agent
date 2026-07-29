@@ -8,7 +8,11 @@ The agent is designed for llama.cpp or a similar local server. It does not requi
 
 ```bash
 # 1. Install dependencies and browser
+# Option A: make targets
 make install && make browsers
+
+# Option B: install script
+scripts/install_ubuntu24.sh
 
 # 2. Edit the three user-facing config files
 #    config/profile.md   - roles, expertise, exclusions, and detailed preferences
