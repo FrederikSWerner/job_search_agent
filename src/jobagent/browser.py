@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import random
+import time
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any
 
@@ -8,9 +11,49 @@ from .models import LinkCandidate, PageSnapshot
 from .structured import extract_jobpostings, structured_jobs_as_text
 
 
+class BrowserFetchError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        kind: str,
+        requested_url: str,
+        final_url: str = "",
+        status_code: int | None = None,
+    ) -> None:
+        self.kind = kind
+        self.requested_url = requested_url
+        self.final_url = final_url
+        self.status_code = status_code
+
+        if kind == "http":
+            message = f"HTTP {status_code or 0}"
+        else:
+            message = f"browser {kind} failure"
+        super().__init__(f"{message} while opening {requested_url}")
+
+    @property
+    def page_status(self) -> str:
+        if self.kind == "http":
+            return f"error:http_{self.status_code or 'unknown'}"
+        if self.kind == "navigation_timeout":
+            return "error:navigation_timeout"
+        return f"error:{self.kind}"
+
+
 class BrowserSession:
-    def __init__(self, config: JobAgentConfig) -> None:
+    def __init__(
+        self,
+        config: JobAgentConfig,
+        *,
+        clock: Callable[[], float] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+        uniform: Callable[[float, float], float] | None = None,
+    ) -> None:
         self.config = config
+        self._clock = clock or time.monotonic
+        self._sleeper = sleeper or time.sleep
+        self._uniform = uniform or random.uniform
+        self._last_navigation_at: float | None = None
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -26,13 +69,7 @@ class BrowserSession:
         self._playwright = sync_playwright().start()
         browser_type = getattr(self._playwright, self.config.browser.engine)
         self._browser = browser_type.launch(headless=self.config.browser.headless)
-        self._context = self._browser.new_context(
-            user_agent=self.config.app.user_agent,
-            viewport={
-                "width": self.config.browser.viewport_width,
-                "height": self.config.browser.viewport_height,
-            },
-        )
+        self._context = self._browser.new_context(**self._context_options())
         return self
 
     def __exit__(
@@ -52,21 +89,37 @@ class BrowserSession:
         if self._context is None:
             raise RuntimeError("BrowserSession must be used as a context manager")
 
-        page = self._context.new_page()
-        page.set_default_timeout(self.config.browser.navigation_timeout_ms)
+        page: Any = None
+        phase = "setup"
 
         try:
+            page = self._context.new_page()
+            page.set_default_timeout(self.config.browser.navigation_timeout_ms)
+            self._pace()
+            phase = "navigation"
             response = page.goto(
                 url,
                 wait_until=self.config.browser.wait_until,
                 timeout=self.config.browser.navigation_timeout_ms,
             )
-            status_code = int(response.status) if response is not None else 0
+            final_url = self._page_url(page, url)
+            if response is None:
+                raise BrowserFetchError(
+                    kind="no_response",
+                    requested_url=url,
+                    final_url=final_url,
+                )
+
+            status_code = int(response.status)
             if (
                 self.config.browser.fail_on_http_error_statuses
                 and status_code >= self.config.browser.http_error_status_min
             ):
-                raise RuntimeError(f"HTTP {status_code} while opening {url}")
+                raise self._http_error(
+                    response=response,
+                    requested_url=url,
+                    final_url=final_url,
+                )
 
             if self.config.browser.network_idle_timeout_ms > 0:
                 try:
@@ -77,6 +130,7 @@ class BrowserSession:
                 except Exception:
                     pass
 
+            phase = "page_processing"
             title = page.title() or ""
 
             try:
@@ -96,7 +150,7 @@ class BrowserSession:
 
             links = [
                 LinkCandidate(text=str(item.get("text") or ""), url=str(item.get("url") or ""))
-                for item in raw_links[: self.config.crawler.max_raw_links_retained]
+                for item in raw_links
             ]
 
             try:
@@ -114,12 +168,78 @@ class BrowserSession:
 
             return PageSnapshot(
                 url=url,
-                final_url=page.url or url,
+                final_url=self._page_url(page, url),
                 title=title,
                 text=text,
                 links=links,
-                structured_jobs=structured_jobs,
                 status_code=status_code,
             )
+        except BrowserFetchError:
+            raise
+        except Exception as exc:
+            if phase == "navigation":
+                kind = (
+                    "navigation_timeout"
+                    if "timeout" in type(exc).__name__.casefold()
+                    else "navigation"
+                )
+            elif phase == "setup":
+                kind = "setup"
+            else:
+                kind = "page_processing"
+            raise BrowserFetchError(
+                kind=kind,
+                requested_url=url,
+                final_url=self._page_url(page, url),
+            ) from exc
         finally:
-            page.close()
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+    def _context_options(self) -> dict[str, object]:
+        return {
+            "user_agent": self.config.app.user_agent,
+            "viewport": {
+                "width": self.config.browser.viewport_width,
+                "height": self.config.browser.viewport_height,
+            }
+        }
+
+    def _pace(self) -> None:
+        now = self._clock()
+        if self._last_navigation_at is None:
+            self._last_navigation_at = now
+            return
+
+        interval = self._uniform(
+            self.config.run.min_delay_seconds,
+            self.config.run.max_delay_seconds,
+        )
+        remaining = interval - (now - self._last_navigation_at)
+        if remaining > 0:
+            self._sleeper(remaining)
+        self._last_navigation_at = self._clock()
+
+    @staticmethod
+    def _page_url(page: Any, fallback: str) -> str:
+        try:
+            return str(page.url or fallback)
+        except Exception:
+            return fallback
+
+    def _http_error(
+        self,
+        *,
+        response: Any,
+        requested_url: str,
+        final_url: str,
+    ) -> BrowserFetchError:
+        return BrowserFetchError(
+            kind="http",
+            requested_url=requested_url,
+            final_url=final_url,
+            status_code=int(response.status),
+        )

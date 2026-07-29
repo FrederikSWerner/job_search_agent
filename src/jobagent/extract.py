@@ -2,61 +2,62 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Literal, cast
 
 from .config import JobAgentConfig
-from .language import multilingual_relevance_terms
-from .models import JobMatch, LinkCandidate, PageDecision, PageSnapshot, QuerySuggestion, as_text, clamp_int
-from .urltools import clean_url, denied_by_safety, link_hint_score, same_domain
+from .models import LinkClassification, PageDecision, as_text
 
 
 def compact_text(text: str, config: JobAgentConfig) -> str:
     normalized = re.sub(r"[ \t]+", " ", text or "")
     lines = [line.strip() for line in normalized.splitlines() if line.strip()]
-    head = lines[: config.crawler.max_compact_lines]
+    max_chars = config.crawler.max_page_context_chars
 
-    important_terms = multilingual_relevance_terms(config)
+    important_terms = tuple(
+        term.lower()
+        for term in (
+            config.target.roles
+            + config.crawler.job_link_hints
+            + config.matching.location_aliases
+            + config.matching.preferred_terms
+            + config.matching.avoid_terms
+            + config.exploration.local_area_terms
+            + config.exploration.source_discovery_terms
+        )
+        if term.strip()
+    )
+    marker = "\n\nLIKELY RELEVANT LINES:\n"
     important: list[str] = []
+    seen_important: set[str] = set()
+    important_budget = max(0, max_chars // 2 - len(marker))
+    important_chars = 0
 
     for line in lines:
         low = line.lower()
-        if any(term.lower() in low for term in important_terms):
-            important.append(line)
-        if len(important) >= config.crawler.max_important_lines:
+        if not any(term in low for term in important_terms):
+            continue
+        if line in seen_important:
+            continue
+        separator_chars = 1 if important else 0
+        remaining = important_budget - important_chars - separator_chars
+        if remaining <= 0:
+            break
+        piece = line[:remaining]
+        important.append(piece)
+        seen_important.add(line)
+        important_chars += separator_chars + len(piece)
+        if len(piece) < len(line):
             break
 
-    body = "\n".join(head)
-    if important:
-        body += "\n\nLIKELY RELEVANT LINES:\n"
-        body += "\n".join(important)
+    if not important:
+        return "\n".join(lines)[:max_chars]
 
-    return body[: config.crawler.max_page_text_chars]
+    suffix = marker + "\n".join(important)
+    head_budget = max(0, max_chars - len(suffix))
+    return "\n".join(lines)[:head_budget] + suffix
 
 
-def rank_candidate_links(snapshot: PageSnapshot, config: JobAgentConfig) -> list[LinkCandidate]:
-    ranked: list[LinkCandidate] = []
-    seen: set[str] = set()
 
-    for link in snapshot.links[: config.crawler.max_raw_links_retained]:
-        url = clean_url(link.url, snapshot.final_url or snapshot.url, config)
-        if not url or url in seen:
-            continue
-
-        text = re.sub(r"\s+", " ", link.text or "").strip()
-        if denied_by_safety(url, text, config):
-            continue
-
-        score, reason = link_hint_score(url, text, config)
-        if score <= 0:
-            continue
-        if same_domain(url, snapshot.final_url or snapshot.url):
-            score += 0.25
-
-        seen.add(url)
-        ranked.append(LinkCandidate(text=text[:240], url=url, score=score, reason=reason))
-
-    ranked.sort(key=lambda x: x.score, reverse=True)
-    return ranked[: config.crawler.max_links_per_page_for_llm]
 
 
 def strip_llm_noise(raw: str) -> str:
@@ -83,52 +84,40 @@ def parse_json_object(raw: str) -> dict[str, Any]:
 
 
 def page_decision_from_dict(data: dict[str, Any]) -> PageDecision:
-    jobs: list[JobMatch] = []
-
-    for item in data.get("jobs", []) or []:
+    link_classifications = []
+    for item in data.get("link_classifications", []) or []:
         if not isinstance(item, dict):
             continue
-        job = JobMatch(
+        raw_index = item.get("index")
+        if isinstance(raw_index, bool):
+            continue
+        if isinstance(raw_index, int):
+            index = raw_index
+        elif isinstance(raw_index, str) and raw_index.strip().isdigit():
+            index = int(raw_index.strip())
+        else:
+            continue
+        try:
+            fit_score = int(item.get("fit_score") or 0)
+        except (TypeError, ValueError):
+            continue
+        classification_type = as_text(item.get("type", "skip"), 30)
+        if classification_type not in {"job_listing", "explore", "skip"}:
+            continue
+        if not 0 <= fit_score <= 100:
+            continue
+        if classification_type == "skip":
+            fit_score = 0
+        classification = LinkClassification(
+            index=index,
+            type=cast(Literal["job_listing", "explore", "skip"], classification_type),
+            fit_score=fit_score,
             title=as_text(item.get("title"), 300),
             company=as_text(item.get("company"), 200),
             location=as_text(item.get("location"), 200),
-            url=as_text(item.get("url"), 1500),
-            fit_score=clamp_int(item.get("fit_score"), 0, 100),
-            reason=as_text(item.get("reason"), 800),
             evidence=as_text(item.get("evidence"), 800),
-            posting_language=as_text(item.get("posting_language") or item.get("language"), 80),
-            score_source=as_text(item.get("score_source"), 80) or "llm",
-            score_basis=as_text(item.get("score_basis"), 1000),
+            reason=as_text(item.get("reason"), 800),
         )
-        if job.title and job.url:
-            jobs.append(job)
+        link_classifications.append(classification)
 
-    follow_urls = []
-    for value in data.get("follow_urls", []) or []:
-        if isinstance(value, str) and value.strip():
-            follow_urls.append(value.strip())
-
-    return PageDecision(
-        jobs=jobs,
-        follow_urls=list(dict.fromkeys(follow_urls)),
-        source_quality=clamp_int(data.get("source_quality"), 0, 100),
-        source_notes=as_text(data.get("source_notes"), 1000),
-    )
-
-
-def query_suggestions_from_dict(data: dict[str, Any]) -> list[QuerySuggestion]:
-    suggestions: list[QuerySuggestion] = []
-    for item in data.get("queries", []) or []:
-        if isinstance(item, str):
-            query = item.strip()
-            reason = ""
-        elif isinstance(item, dict):
-            query = str(item.get("query") or "").strip()
-            reason = str(item.get("reason") or "").strip()
-        else:
-            continue
-
-        if query:
-            suggestions.append(QuerySuggestion(query=query[:400], reason=reason[:800]))
-
-    return suggestions
+    return PageDecision(link_classifications=link_classifications)

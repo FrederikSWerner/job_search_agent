@@ -8,33 +8,32 @@
 # --- Location ---
 location:
   # Human-readable target area used in prompts and logs.
-  local_area: "Munich, Germany"
-
-  # City name used for radius checks and exploration URL filtering.
-  target_city: "Munich"
-
-  # Coordinates for the target city (hardcoded for the 30 km radius filter).
-  latitude: 48.137154
-  longitude: 11.576124
-
-  # Hard radius in km for non-remote jobs.
-  radius_km: 30.0
-
-  # Languages to understand. Language itself is not scored positively or negatively.
-  languages: [German, English]
+  local_area: "Munich, Bavaria, Germany"
 
 # --- Companies ---
 companies:
-  # Drop exported jobs from these companies. Leave empty unless needed.
+  # Drop matching jobs before persistence. Leave empty unless needed.
   blacklist:
     - Futrue GmbH
-
-# --- Search tools ---
-search:
-  # Direct search endpoints for exploratory profile searches.
-  # Avoid generic search engines by default because they frequently return 403
-  # or CAPTCHA pages in unattended local runs.
-  search_url_templates:
-    - https://www.linkedin.com/jobs/search/?keywords={query}&location=Munich%2C%20Bavaria%2C%20Germany
-    - https://www.stepstone.de/jobs/{query_slug}/in-m%C3%BCnchen
-    - https://www.stellenanzeigen.de/jobs/{query_slug}/muenchen
+    - PharmaSGP Holding SE
+  # Companies to proactively search for. Randomly injected into ~50% of bootstrap queries.
+  whitelist:
+    - ZEISS
+    - TRUMPF
+    - Rohde & Schwarz
+    - HENSOLDT
+    - OSRAM
+    - Airbus Defence & Space
+    - Coherent
+    - SUSS MicroTec
+    - TOPTICA Photonics
+    - Blickfeld
+    - Marvel Fusion
+    - BMW
+    - Isar Aerospace
+    - Rheinmetall
+    - TYTAN
+    - Helsing
+    - Quantum Systems
+    - Stark
+    - KNDS

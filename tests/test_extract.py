@@ -1,57 +1,74 @@
 from __future__ import annotations
 
-from jobagent.extract import compact_text, page_decision_from_dict, parse_json_object, rank_candidate_links
-from jobagent.models import LinkCandidate, PageSnapshot
+from jobagent.extract import compact_text, page_decision_from_dict, parse_json_object
 
 
 def test_parse_json_object_strips_thinking_and_fences():
-    raw = '<think>ignored</think>```json\n{"jobs": [], "follow_urls": [], "source_quality": 50}\n```'
+    raw = '<think>ignored</think>```json\n{"link_classifications": []}\n```'
     parsed = parse_json_object(raw)
-    assert parsed["source_quality"] == 50
+    assert parsed == {"link_classifications": []}
 
 
-def test_page_decision_parses_and_clamps_score():
+def test_page_decision_parses_link_classifications():
     decision = page_decision_from_dict(
         {
-            "jobs": [
+            "link_classifications": [
                 {
-                    "title": "Procurement Manager",
-                    "company": "Acme",
-                    "location": "München",
-                    "url": "https://acme.test/jobs/1",
-                    "fit_score": 150,
-                    "reason": "Procurement",
-                    "evidence": "Procurement Manager",
-                }
+                    "index": 0,
+                    "type": "job_listing",
+                    "fit_score": 85,
+                    "title": "Buyer",
+                    "company": "Example",
+                    "location": "Munich",
+                    "evidence": "Strategic sourcing",
+                    "reason": "Strong fit",
+                },
+                {"index": 1, "type": "explore", "fit_score": 73},
+                {"index": 2, "type": "skip", "fit_score": 100},
             ],
-            "follow_urls": ["https://acme.test/jobs"],
-            "source_quality": 120,
         }
     )
-    assert decision.jobs[0].fit_score == 100
-    assert decision.source_quality == 100
+
+    assert len(decision.link_classifications) == 3
+    assert decision.link_classifications[0].title == "Buyer"
+    assert decision.link_classifications[0].url == ""
+    assert decision.link_classifications[1].type == "explore"
+    assert decision.link_classifications[1].fit_score == 73
+    assert decision.link_classifications[2].fit_score == 0
 
 
-def test_rank_candidate_links_filters_noise(loaded_sample):
-    cfg = loaded_sample.config
-    snapshot = PageSnapshot(
-        url="https://acme.test",
-        final_url="https://acme.test",
-        title="Acme",
-        text="",
-        links=[
-            LinkCandidate(text="Careers", url="/careers"),
-            LinkCandidate(text="Login", url="/login"),
-            LinkCandidate(text="PDF", url="/brochure.pdf"),
-            LinkCandidate(text="About", url="/about"),
-        ],
+def test_page_decision_rejects_malformed_classifications():
+    decision = page_decision_from_dict(
+        {
+            "link_classifications": [
+                {"type": "job_listing", "fit_score": 80},
+                {"index": "bad", "type": "job_listing", "fit_score": 80},
+                {"index": 1.9, "type": "job_listing", "fit_score": 80},
+                {"index": 1, "type": "invented", "fit_score": 80},
+                {"index": 2, "type": "job_listing", "fit_score": 101},
+                {"index": 3, "type": "explore", "fit_score": 99},
+            ],
+        }
     )
-    ranked = rank_candidate_links(snapshot, cfg)
-    assert [x.url for x in ranked] == ["https://acme.test/careers"]
+
+    assert [(item.index, item.type, item.fit_score) for item in decision.link_classifications] == [
+        (3, "explore", 99)
+    ]
 
 
-def test_compact_text_keeps_relevant_lines(loaded_sample):
-    cfg = loaded_sample.config
-    text = "hello\nProcurement Manager role in Munich\nother"
-    compacted = compact_text(text, cfg)
+def test_compact_text_keeps_relevant_lines(temp_loaded):
+    noise = "unrelated navigation " * 10
+    text = "\n".join([noise] * 181 + ["Procurement Manager role in Munich"])
+    compacted = compact_text(text, temp_loaded.config)
+
+    assert len(compacted) <= temp_loaded.config.crawler.max_page_context_chars
     assert "Procurement Manager role in Munich" in compacted
+
+
+def test_compact_text_uses_full_character_budget_without_relevant_lines(temp_loaded):
+    temp_loaded.config.crawler.max_page_context_chars = 80
+
+    compacted = compact_text("ordinary text\n" * 20, temp_loaded.config)
+
+    assert len(compacted) == 80
+    assert compacted.startswith("ordinary text\nordinary text")

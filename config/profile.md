@@ -1,10 +1,10 @@
 # Candidate profile
 
-Edit this file to change what the agent searches for. This file is now the single source of truth for role vocabulary, preferred expertise, industry fit, and exclusions. The YAML config should mostly stay operational: paths, LLM endpoint, crawl limits, radius, memory, and logging.
+Edit this file to change the target roles and profile context used by the LLM. Role vocabulary, preferred expertise, industry fit, exclusions, and detailed search preferences belong here. YAML is reserved for operational settings plus short local-area, language, and company values.
 
 ## Search area
 
-I am looking for jobs in the Munich area, Germany. Good locations include Munich/München and towns within roughly 30 km of Munich. Hybrid roles with regular office presence near Munich are acceptable. Remote roles are acceptable only when they can clearly be performed from Germany.
+I am looking for jobs in the Munich area, Germany. Good locations include Munich/München and towns within roughly 10 km of Munich. Hybrid roles with regular office presence near Munich are acceptable. Remote roles are acceptable only when they can clearly be performed from Germany.
 
 The target market is Germany. German-language, English-language, and mixed German-English postings are all acceptable. German employers may publish German navigation pages but English job titles.
 
@@ -20,7 +20,6 @@ The target market is Germany. German-language, English-language, and mixed Germa
 - Supply Chain Manager / Supply-Chain-Manager
 - Supply Chain Quality Manager / Supply Chain Qualitätsmanager
 - Supplier Quality Manager / Lieferantenqualitätsmanager
-- Supplier Quality Engineer / Lieferantenqualitätsingenieur
 - Supplier Development Manager / Lieferantenentwickler
 - Supplier Manager / Lieferantenmanager
 - Quality Manager Procurement / Qualitätsmanager Einkauf
@@ -60,10 +59,13 @@ The target market is Germany. German-language, English-language, and mixed Germa
 
 ## Relevant expertise and positive fit factors
 
+- senior position
 - optical components
 - laser components
 - optics
 - photonics
+- strategic
+- defence
 - laser technology
 - optical assemblies
 - precision components
@@ -105,6 +107,16 @@ The target market is Germany. German-language, English-language, and mixed Germa
 - Sales Manager
 - Field Sales / Außendienst Vertrieb
 - Inside Sales
+- Vice President
+- Head of
+- Chief
+- Global Head
+- Team Lead
+- Operational Buyer
+- Operativer Einkäufer
+- Department Lead
+- Abteilungsleiter
+- Teamleiter
 - Account Executive
 - Key Account Manager
 - Business Development
@@ -112,9 +124,12 @@ The target market is Germany. German-language, English-language, and mixed Germa
 - pure electronics engineer roles
 - Electronics Engineer / Elektronikentwickler
 - Electrical Engineer
+- Engineer
 - Hardware Engineer
 - Software Engineer
 - Embedded Engineer
+- Consultant
+- Berater
 - Application Engineer
 - Field Service Engineer
 - Service Engineer
@@ -140,3 +155,4 @@ The target market is Germany. German-language, English-language, and mixed Germa
 - talent pool
 - talent community
 - general application
+- marternity cover

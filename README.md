@@ -1,137 +1,121 @@
 # jobagent-local
 
-`jobagent-local` is a read-only autonomous job-discovery agent for Ubuntu 24.x. It browses public company career pages and public job-portal result pages, extracts likely jobs, scores them against `config/profile.md` with a local OpenAI-compatible LLM server, and learns which sources are worth revisiting.
+`jobagent-local` is a read-only job-discovery agent for Ubuntu 24.x. Playwright loads public career, search, and listing pages, fetches the destinations linked from each page, and sends those destination contexts to a local OpenAI-compatible LLM for classification against `config/profile.md`.
 
-The repo is designed for a local `llama.cpp` / Qwen server. It does not require command-line arguments.
+The agent is designed for llama.cpp or a similar local server. It does not require command-line arguments.
+
+## Quick start
+
+```bash
+# 1. Install dependencies and browser
+make install && make browsers
+
+# 2. Edit the three user-facing config files
+#    config/profile.md   - roles, expertise, exclusions, and detailed preferences
+#    config/intent.yaml  - local area and company lists
+#    config/config.yaml  - LLM endpoint, context size, batching, and runtime settings
+
+# 3. Start the local LLM server and check its configured endpoint
+curl http://127.0.0.1:<PORT>/v1/models
+
+# 4. Run
+scripts/run.sh
+```
+
+Results are written to `data/jobs.csv` and `data/jobs.sqlite`.
+
+`crawler.batch_size_for_llm` and `crawler.max_page_context_chars` bound the number and size of destination contexts in each classification request.
 
 ## Core design
 
-The configuration has been simplified so that there is one source of truth for job-search intent:
+The agent uses five configuration inputs:
 
-```text
-config/profile.md   target roles, aliases, expertise, industries, seniority, exclusions
-config/config.yaml  operational settings only: LLM endpoint, crawl limits, search mode, radius, memory, logging
-config/prompts.yaml generic LLM instructions; no target-role-specific content
-config/seeds.txt    optional public starting URLs
-```
+| File | Purpose |
+|---|---|
+| `config/profile.md` | Candidate profile supplied to the LLM; also provides target roles and text-relevance terms |
+| `config/intent.yaml` | Personal values: local area, company blacklist, and bootstrap whitelist |
+| `config/config.yaml` | Operational settings for the LLM, browser, queue, batching, score thresholds, exploration, and logging |
+| `config/prompts.yaml` | Generic LLM instructions with no role-specific content |
+| `config/seeds.txt` | Optional starting URLs for career pages and job-board results |
 
-The agent derives search terms, role-signal terms, positive-fit terms, avoid terms, query vocabulary, and score guardrails from `profile.md`. You should not need to maintain separate role lists in YAML.
+## Active pipeline
 
-## What it does
+The agent runs one queue-driven loop:
 
-```text
-seed/search URL
-  -> open public page in Playwright
-  -> extract visible text, links, and structured JobPosting data
-  -> rank job/career/discovery links
-  -> ask the local LLM whether the loaded page itself is a job-detail page
-  -> save jobs only from loaded job-detail pages, not overview/search pages
-  -> use overview/search pages only to discover follow-up job-detail links
-  -> apply deterministic score/location/safety/company guardrails
-  -> skip exploration URLs that visibly point to cities outside the target radius
-  -> save matched jobs to SQLite + CSV + JSONL
-  -> update persistent source memory
-  -> prioritize future crawling using learned source quality
-  -> optionally ask the LLM for new exploratory search queries
-  -> print structured STEP/RESULT lines to the terminal
-```
+1. **Check the LLM** - when enabled, request the configured `/models` endpoint before opening a browser.
+2. **Apply startup state rules** - optionally clear the backlog or `pages`; otherwise remove retryable transient HTTP error markers when page retries are enabled.
+3. **Seed the backlog** - enqueue URLs from `config/seeds.txt`, generated bootstrap searches, or both, each with rating 89.
+4. **Open a backlog page** - Playwright captures its final URL, title, body text, links, and any `JobPosting` JSON-LD rendered as text.
+5. **Check and fetch outbound destinations** - URLs are normalized, checked against URL-only crawl rules, stripped of tracking parameters, and deduplicated. A requested or final URL already present in `pages` is dropped before fetching. URLs attempted during the current run are also dropped, without being persisted merely because they were opened.
+6. **Classify the links** - the LLM receives source-page metadata plus each link's text, URL, and destination context. The source body is not included. It returns `link_classifications` with type `job_listing`, `explore`, or `skip`. For `explore`, `fit_score` estimates the likelihood of finding a suitable target-area job through that URL.
+7. **Route classifications** - `job_listing` and `skip` destinations are recorded in `pages`. A `job_listing` at or above `scoring.min_score_to_export` becomes a job candidate. An `explore` URL at or above `scoring.min_score_to_explore` enters the backlog with its score as the rating when exploration is enabled, but is not recorded in `pages`.
+8. **Filter and save** - Python applies the company blacklist, removes duplicate job URLs from the batch, and upserts jobs by URL. CSV is rewritten from SQLite after each non-empty save.
+9. **Continue** - the successfully processed source is removed from the backlog without being added to `pages`, and the loop runs until no queued URL remains.
 
-The LLM is used for judgement. Python enforces boundaries: crawl limits, depth limits, URL validation, deduplication, safety filters, radius checks, source-memory scoring, prompt-size control, and persistence.
+Fetching an outbound destination for classification does not automatically queue it. Only links classified as `explore` at or above `scoring.min_score_to_explore` enter the backlog. The `rating` queue mode processes the highest rating first and uses insertion order for ties.
 
-## Safety boundaries
+Every Playwright navigation passes through one global pacing interval configured by `run.min_delay_seconds` and `run.max_delay_seconds`. Playwright uses the application user agent configured under `app.user_agent`.
 
-The agent is read-only. It does not log in, submit applications, bypass CAPTCHA, auto-apply, upload documents, or click submit buttons.
+### Seeds and bootstrap searches
 
-`robots.txt` handling is controlled by:
+`seeding.mode` controls startup:
 
-```yaml
-crawler:
-  respect_robots_txt: false
-```
+- **`seeds`** - use only normalized, deduplicated URLs from `config/seeds.txt`.
+- **`bootstrap`** - build one search phrase per target role using the role, the configured local area, a random job suffix, and sometimes a whitelisted company, then render it through each search URL template.
+- **`both`** - combine both sources. The repository configuration currently uses this mode.
 
-Set this to `true` if you want stricter crawler behavior.
+The configured template uses Brave Search. Public search services may present bot checks that the agent does not bypass. Startup URLs are authoritative work items and are enqueued on every run even if they already exist in `pages`; this lets a stable seed discover newly added outbound links.
+
 
 ## Install
 
-From the repo root:
-
 ```bash
+# Option 1: make targets
+make install && make browsers
+
+# Option 2: install script
 scripts/install_ubuntu24.sh
 ```
 
-Manual equivalent:
-
-```bash
-sudo apt update
-sudo apt install -y python3-venv python3-pip sqlite3
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -U pip
-pip install -e '.[dev]'
-playwright install --with-deps chromium
-```
 
 ## Configure
 
 ### 1. Edit `config/profile.md`
 
-This is where you describe what you want. It contains normal Markdown sections such as:
+Describe what you want in plain Markdown. Key sections:
 
-```text
-Target roles and acceptable titles
-Target role signals
-Relevant expertise and positive fit factors
-Especially relevant industries
-Avoid and exclude
-```
+- Target roles and acceptable titles
+- Target role signals (keywords the agent looks for)
+- Relevant expertise and positive fit factors
+- Especially relevant industries
+- Avoid and exclude (roles, titles, shift types to reject)
 
-The parser accepts ordinary bullet lists. For example, if you add a new acceptable title under `Target roles and acceptable titles`, the agent uses it for query generation, link ranking, LLM prompting, heuristic extraction, and score consistency.
+The complete profile is included in the LLM classification prompt. The Markdown parser also derives target roles for bootstrap searches and relevance terms used while compacting fetched text. Profile exclusions guide the LLM; they are not applied as a separate Python filter.
 
-### 2. Edit `config/config.yaml` only for runtime behavior
+### 2. Edit `config/intent.yaml`
 
-Important settings:
+Personal overrides. Contains:
 
-```yaml
-llm:
-  base_url: http://127.0.0.1:8080/v1
-  context_window_tokens: 12000
-  output_tokens: 5000
-  thinking_enabled: false
-  require_available_on_start: true
-  stop_run_on_connection_error: true
+- `location.local_area` - short area description supplied to bootstrap search generation, prompts, and logs
+- `companies.blacklist` - drop matching job classifications before persistence
+- `companies.whitelist` - inject a company into approximately half of generated bootstrap searches
 
-run:
-  reset_frontier_on_start: true
-  max_pages: 80
-  max_depth: 3
-  min_delay_seconds: 0.2
-  max_delay_seconds: 0.8
+### 3. Edit `config/config.yaml`
 
-location_radius:
-  target_city: Munich
-  latitude: 48.137154
-  longitude: 11.576124
-  radius_km: 30.0
-  allowed_country_url_segments: [de, de-de, de_de, deutschland, germany]
-  blocked_country_url_segments: [at, ch, cn, tw, zh_cn, zh_tw, fr, it, es, nl, pl, cz]
+Key areas to review:
 
-matching:
-  min_fit_score_to_save: 55
-  high_fit_score: 80
+- **`llm`** - endpoint, model, timeout, and temperature
+- **`browser`** - headless mode and navigation behavior
+- **`run`** - backlog/page resets, FIFO, shuffled, or rating-first ordering, and the interval between Playwright navigations
+- **`crawler`** - URL normalization/denial rules, next-run transient HTTP retries, LLM batch size, and destination-context size
+- **`scoring`** - minimum job-export and exploration-enqueue scores
+- **`exploration`** - whether LLM-classified `explore` URLs enter the backlog
+- **`seeding`** - seed/bootstrap mode, search URL templates, and job suffixes
+- **`logging`** - info/debug level and console/file output
 
-companies:
-  blacklist: []
+Tune `crawler.batch_size_for_llm` and `crawler.max_page_context_chars` to fit the model server's request limit.
 
-heuristic_extraction:
-  enabled: false
-
-job_validation:
-  require_loaded_job_detail_page: true
-```
-
-The long internal lists that used to live in YAML have moved to Python defaults or are derived from `profile.md`. This avoids maintaining the same role/search/scoring vocabulary in multiple places.
-
-### 3. Optional: edit `config/seeds.txt`
+### 4. Optional: edit `config/seeds.txt`
 
 Add public career pages or job-board result pages. Example:
 
@@ -142,26 +126,9 @@ https://boards.greenhouse.io/some-company
 https://some-job-board.example/jobs/procurement/muenchen
 ```
 
-If `seeds.txt` is empty, the agent creates bootstrap search URLs from `profile.md` and `config/config.yaml`.
-
-### 4. Optional: edit company filters
-
-`config/config.yaml` contains a small company filter section:
-
-```yaml
-companies:
-  blacklist: []
-```
-
-`blacklist` drops matched jobs from unwanted employers. Leave it empty unless needed.
-
-The default `run.reset_frontier_on_start: true` clears stale queued URLs at the start of each run, but keeps saved jobs and learned source memory.
-
-LinkedIn is explicitly included in the default search URL templates and is not globally blocked. Public LinkedIn job-search or job-view URLs can be used as seeds or discovered URLs. LinkedIn signup, legal, authwall, and login URLs are blocked because they waste crawl budget and cannot produce jobs. The agent still does not log in, bypass CAPTCHA, or submit forms.
-
 ## Run
 
-Start your local LLM server first, then run. By default the agent checks `llm.base_url + /models` before opening browser pages. If the model server is down, the run stops with a clear `llm_unavailable_stop` message instead of crawling hundreds of pages without LLM judgement.
+Start your local LLM server first. When `llm.require_available_on_start` is enabled, the agent checks `llm.base_url + /models` and stops with `llm_unavailable_stop` if the server is unreachable.
 
 ```bash
 scripts/run.sh
@@ -174,284 +141,130 @@ Or:
 python -m jobagent
 ```
 
-Use another config file with:
+Override the config file:
 
 ```bash
 JOBAGENT_CONFIG=/absolute/path/to/config.yaml python -m jobagent
 ```
 
-## Terminal output
+Relative profile, seed, prompt, and output paths are resolved from that configuration's project root. Keep `intent.yaml` in the root's `config/` directory.
 
-The agent now prints structured progress lines at process completion points rather than interval-based summaries. Normal output uses `logging.level: info`; set it to `debug` to also see skipped URLs and finer detail.
 
-Example:
 
-```text
-STEP run_start local_area='Munich, Germany' roles='...' max_pages='80' max_depth='3'
-RESULT seed_frontier added='42' queued='42'
-STEP open_page depth='1' priority='56.42' source_key='example.com/jobs' url='https://example.com/jobs'
-RESULT page_fetched title='Search results' candidate_links='18' final_url='https://example.com/jobs'
-RESULT page_analyzed jobs='0' saved='0' high_fit='0' source_quality='55' source_notes='Overview page; follow job detail links.'
-RESULT enqueue_exploration added='7' next_depth='2' queued='48'
-RESULT page_complete saved='0' kept_jobs='0' enqueued='7' queued='48' source_quality='55' title='Search results'
-RESULT export_results reason='page' csv='data/jobs.csv' jsonl='data/jobs.jsonl'
-RESULT run_complete pages_done='80' jobs_saved_total='12' queued='130'
-RESULT run_summary pages=80 jobs_seen=12 jobs_saved=12 high_fit_jobs=4 generated_queries=6 enqueued_urls=246 blocked=0 errors=3 avg_source_quality=58.2 queued=130 elapsed_seconds=912.4 actions=411
-```
+## Persistence and filtering
 
-Configure only this:
+SQLite schema version 3 contains exactly three tables:
 
-```yaml
-logging:
-  # info or debug
-  level: info
-  console: true
-  file: true
-```
-
-## Where the agent accumulates experience
-
-Experience is accumulated in `data/jobs.sqlite`. The most important tables are:
-
-| Table | Purpose |
+| Table | Fields |
 |---|---|
-| `source_memory` | Persistent quality score per source, usually `domain/path-prefix`. This is the main learned memory. |
-| `pages` | Every visited page, final URL, status, title, source key, and how many jobs it produced. |
-| `jobs` | Saved jobs and their final calibrated score. Exported to CSV/JSONL. |
-| `frontier` | Queue of URLs to visit, with priority and discovery reason. |
-| `queries` | Bootstrap and LLM-generated search queries, reuse count, and metadata. |
-| `events` | Optional structured events. |
+| `jobs` | `url`, `title`, `company`, `location`, `fit_score`, `reason`, `evidence`, `source_key`, `first_seen_at`, `last_seen_at`, `original_url` |
+| `pages` | `url`, `final_url`, `status` |
+| `backlog` | `url`, `status`, `queued_at`, `rating`, `queue_position` |
 
-The source memory update happens after each page:
+`pages` is the durable candidate-exclusion and page-error set. Candidate deduplication checks whether a requested or final URL exists there before fetching. Successfully classified `job_listing` and `skip` destinations are persisted with their classification as the status; successfully fetched `explore` destinations and backlog sources are not. Fetch failures are persisted as `error:*` markers.
 
-```text
-jobs found          -> source score increases
-high-fit jobs       -> source score increases more
-high LLM quality    -> source score increases
-no jobs             -> source score decreases slightly
-errors              -> source score decreases
-robots blocks       -> source score decreases
-repeated no-job run -> additional penalty
-```
+When `crawler.retry_error_pages` is enabled, transient HTTP markers (408, 425, 429, and 5xx) are deleted once at startup so those URLs can be attempted once in the new run. Other page errors remain blocked. Backlog enqueueing does not consult `pages`: seed/bootstrap sources can run again, and an outbound destination fetched for classification can still become an `explore` source. The backlog stores no depth or discovery context and retains only queued, active, or errored work plus its rating and stable queue position. Successful rows are deleted. `run.reset_backlog_on_start` clears only backlog rows. `run.reset_pages_on_start` clears all classification and error rows while preserving jobs and backlog; leave it disabled normally and enable it for one cleanup run when needed.
 
-At the start of each run, memory is slightly decayed toward the neutral initial score. This prevents ancient evidence from dominating forever.
+The same URL policy is used for seeds, generated searches, and page links. It accepts configured HTTP schemes; requires a host; rejects configured domains, file extensions, login/account URLs, and initiative/talent-pool/general-application URLs; removes configured tracking parameters and fragments; and normalizes paths. Page links resolving to the source page or to an already-seen canonical URL are removed.
 
-The crawler priority combines:
+Filtering is URL-only. Link text is not inspected, submission endpoints such as `/apply/submit` are not denied, and there is no per-page candidate limit or provider-specific rule. Every unblocked URL that passes the policy is fetched before LLM classification.
 
-```text
-source memory score
-- depth penalty
-+ link hint score
-+ small random jitter
-```
+Valid schema-v2 databases are migrated automatically to v3. Existing backlog rows receive rating 80 and stable queue positions in their prior FIFO order. Older and malformed schemas are not migrated. Interrupted `active` backlog rows are returned to `queued` when the database is reopened. Errored backlog rows are also requeued when `crawler.retry_error_pages` is enabled; old `done` and `skipped_visited` rows are removed. Historical `pages` rows do not contain classifications, so use `run.reset_pages_on_start` for one run to discard old attempted-URL markers.
 
-Good sources rise in the queue. Weak or failing sources fall. Very weak sources are skipped once they fall below `memory.blacklist_below_score`.
+For a saved job, `source_key` contains the normalized domain and first path segment of the backlog page being processed. Before saving, jobs are matched by exact URL or by at least 90% normalized similarity in each of title, company, and location, regardless of source. Company matching ignores common legal and organizational suffixes. If several existing rows match, the oldest `first_seen_at` is preserved, the other matching rows are deleted, and the canonical row receives the latest URL, source, job fields, and `last_seen_at`. SQLite's exact-URL upsert remains the final uniqueness safeguard.
 
-Memory is also sent back into the LLM prompt as a compact summary of good sources, weak sources, and recent matched jobs. That is the autoregressive loop: the agent's previous browsing results influence future browsing, query generation, and source prioritization.
+The LLM decides whether a destination is a job and supplies its score and fields. A job's `fit_score` measures concrete job fit; an accepted explore classification's `fit_score` becomes its backlog rating. Runtime job acceptance then consists of:
 
-Inspect memory:
+- a successfully fetched destination context
+- `type == "job_listing"`
+- `fit_score >= scoring.min_score_to_export`
+- no company-blacklist alias match across the returned job text and URL, or 90%-similar match against the returned company name
+- no exact or fuzzy duplicate in the current batch or existing jobs across sources; SQLite subsequently upserts by exact URL as a final safeguard
 
-```bash
-sqlite3 data/jobs.sqlite '
-select source_key, score, visits, jobs_found, high_fit_jobs, no_job_streak, notes
-from source_memory
-order by score desc
-limit 25;
-'
-```
+Runtime exploration enqueueing requires `exploration.enabled`, `type == "explore"`, and `fit_score >= scoring.min_score_to_explore`. This threshold is not included in the LLM prompt and does not alter the returned score.
 
-Reset all learned memory and results:
+Location preferences and profile exclusions are LLM context. Python does not calculate geographic distance or alter the returned fit score.
 
-```bash
-rm -f data/jobs.sqlite data/jobs.sqlite-* data/jobs.csv data/jobs.jsonl
-```
+## LLM request sizing
 
-## Detail-page-only extraction
+`crawler.batch_size_for_llm` limits successfully fetched destination contexts per request. Candidates dropped as already visited, failed fetches, and rejected redirects do not consume a slot; the agent continues through the source links until the batch is full or no candidates remain.
 
-By default, a row is saved to `jobs.csv` only when the browser has actually loaded a concrete job-detail page. Listing pages, search pages, city pages, and overview pages are used only for discovery.
-
-This is controlled by:
-
-```yaml
-job_validation:
-  require_loaded_job_detail_page: true
-```
-
-With this enabled, the LLM must return the loaded page's `Final URL` as the job URL. Candidate links from an overview page go into `follow_urls`; they are not saved directly as jobs. This prevents CSV links from leading back to search/result pages.
-
-## Fit score in the CSV
-
-`jobs.csv` does not calculate the score. It exports the score already saved in SQLite.
-
-There are two origins:
-
-| `score_source` | Meaning |
-|---|---|
-| `llm` | The local model produced the raw fit score. |
-| `llm_guarded` | The model produced the score, then Python capped it for consistency. |
-| `heuristic_structured` | Optional fallback from structured `schema.org/JobPosting`; disabled by default. |
-| `heuristic_link` | Optional fallback from a strong job-detail link; disabled by default. |
-
-The LLM is allowed to generate scores, but `src/jobagent/scoring.py` applies deterministic guardrails before saving. These guardrails use terms derived from `profile.md`:
-
-```text
-missing target-role signal -> cap below save threshold
-profile exclusion match    -> cap below save threshold
-unclear/wrong location     -> cap or drop
-initiative/talent-pool URL -> drop
-city/filter title          -> drop
-blacklisted company        -> drop
-weak evidence/reason       -> cap
-```
-
-This prevents unrelated roles from being saved with medium-high scores just because the employer, city, or industry looks attractive.
-
-## Prompt files are generic
-
-`config/prompts.yaml` intentionally contains no procurement-, purchasing-, optics-, laser-, or Munich-specific role instructions. It only says how to extract jobs, score against the profile, return JSON, and generate search queries.
-
-All target-specific information comes from:
-
-```text
-config/profile.md
-config/config.yaml location/radius settings
-SQLite source memory
-current page text and candidate links
-```
-
-## Location radius
-
-The default build enforces:
-
-```yaml
-location_radius:
-  enabled: true
-  target_city: Munich
-  radius_km: 30.0
-  hard_drop_outside_radius: true
-  require_location_for_non_remote: true
-  allow_remote_if_country_match: true
-```
-
-Non-remote jobs must name a city/location inside the radius. Broad-only locations such as `Germany`, `Deutschland`, `Bavaria`, or `Bayern` are treated as insufficient unless the posting clearly allows Germany-remote work.
-
-Known Munich-area towns and common outside German cities are stored as internal defaults in `src/jobagent/config.py`. You can still override `location_radius.city_coordinates` in YAML if needed, but normal users should not need to.
-
-The same radius logic is also used before opening exploration URLs. URL text and link text are evaluated independently from the originating search query, so a Munich search-results page can no longer make `/pforzheim-technischer-einkaeufer...`, `/buchloe-...`, or `/fridolfing-...` look acceptable. Unknown-location company root pages are still allowed because many career pages do not encode a city in the URL.
-
-## LLM context window
-
-The visible token settings are deliberately simple:
-
-```yaml
-llm:
-  context_window_tokens: 12000
-  output_tokens: 5000
-```
-
-The script derives the internal prompt budget automatically:
-
-```text
-usable prompt budget = context_window_tokens - output_tokens - automatic safety margin
-```
-
-If a page is too large, the prompt builder trims page text, profile text, source memory, and candidate links before sending the request. This prevents llama.cpp errors like:
-
-```text
-request (...) exceeds the available context size (...)
-```
-
-For Qwen thinking models, `thinking_enabled: true` may improve judgement on ambiguous postings, but the default is `false` because strict JSON is more important for this crawler. Turn it on only if your server remains JSON-reliable.
+`crawler.max_page_context_chars` limits each destination context. Compaction uses part of that character budget for the start of the page and part for unique lines containing profile-derived roles, locations, preferences, exclusions, and exploration terms. The source page's body text is not sent to the LLM. There is no local token estimate or automatic request splitting; if the server rejects a request, the source is handled as a normal LLM failure.
 
 ## Outputs
 
-```text
-data/jobs.sqlite   full state: jobs, pages, frontier, queries, source memory
-data/jobs.csv      spreadsheet-friendly results; `title` is the third column
-data/jobs.jsonl    machine-readable results
-data/jobagent.log  run log
-```
+| File | Description |
+|---|---|
+| `data/jobs.sqlite` | SQLite v3 jobs, classified/error pages, and rated URL backlog |
+| `data/jobs.csv` | Spreadsheet-friendly job rows |
+| `data/jobagent.log` | Run log |
 
-`jobs.csv` and `jobs.jsonl` are checkpointed after each processed page by default, so partial results should appear while the crawler is still running.
+CSV uses these fields, in this order:
+
+`fit_score`, `title`, `company`, `location`, `url`, `reason`, `evidence`, `source_key`, `first_seen_at`, `last_seen_at`, `original_url`
+
+The export is synchronized from all SQLite job rows on database startup and after every `save_jobs()` call that writes at least one job. Rows are ordered by descending fit score and then most recent `last_seen_at`.
+
+Failed browser navigations retain the requested/final URL, failure category, and HTTP status when available. Failures persist concise statuses such as `error:http_429`, `error:navigation_timeout`, or `error:RuntimeError` and are excluded from the LLM request. When retries are enabled, transient HTTP markers are cleared at the next startup; they are not bypassed repeatedly during the same run. Source failures retain an errored backlog row, while successful sources delete their backlog row and any matching stale error marker.
 
 Inspect top jobs:
 
 ```bash
 sqlite3 data/jobs.sqlite '
-select fit_score, score_source, title, company, location, posting_language, url
-from jobs
-order by fit_score desc, last_seen_at desc
-limit 25;
+select fit_score, title, company, location, url
+from jobs order by fit_score desc, last_seen_at desc limit 25;
 '
 ```
 
-## Tests
+Reset all persisted state and exports:
 
-Run:
+```bash
+rm -f data/jobs.sqlite data/jobs.sqlite-* data/jobs.csv
+```
+
+## Tests
 
 ```bash
 scripts/test.sh
 ```
 
-The suite covers config loading, profile-derived vocabulary, URL normalization, safety filtering, multilingual link ranking, LLM JSON parsing, SQLite memory, frontier seeding, follow-link exploration, heuristic fallback extraction, query generation, Munich radius filtering, job validation, prompt budgeting, structured logging, and score guardrails.
+This runs pytest followed by `compileall`; `make test` runs pytest only. Test files cover configuration and profile derivation, bootstrap seeding, URL handling, link-classification routing, company filtering, the SQLite v3 schema and exports, LLM JSON/context handling, and reporting. Agent tests use fake browser/LLM implementations where supplied.
 
-Validation performed in the build environment:
+The suite is network-isolated; agent tests use fake browser and LLM implementations.
 
-```text
+Run in your environment:
+
+```bash
 PYTHONPATH=src pytest -q
- 76 passed
-
 PYTHONPATH=src python -m compileall -q src tests
-compileall_ok
 ```
-
-Tests use mocked browser and LLM components. Live crawling still depends on your network, target websites, and local LLM server.
 
 ## Troubleshooting
 
-### `seeded_frontier=0 queued=0`
+### `seed_backlog added=0 queued=0`
 
-The agent has no usable starting URLs and did not enqueue bootstrap search URLs. Check:
-
-```yaml
-exploration:
-  seed_search_when_empty: true
-```
-
-Also check that `config/seeds.txt` contains active URLs. Stale frontier state is normally cleared automatically because `run.reset_frontier_on_start` defaults to `true`. For a completely clean run, remove the database and exported files:
+Check `seeding.mode` and verify that `config/seeds.txt` contains usable URLs. Previously visited seeds are still enqueued; an already queued duplicate is not counted as another addition. For a deliberately clean run:
 
 ```bash
-rm -f data/jobs.sqlite data/jobs.sqlite-* data/jobs.csv data/jobs.jsonl
+rm -f data/jobs.sqlite data/jobs.sqlite-* data/jobs.csv
 ```
 
 ### LLM connection errors
 
-Check:
+Check the endpoint in `config/config.yaml`, then verify:
 
 ```bash
-curl http://127.0.0.1:8080/v1/models
+curl <llm.base_url>/models
 ```
 
-Then confirm `llm.base_url`, `llm.model`, and `llm.chat_endpoint`.
-
-### LLM page analysis fails
-
-The agent logs compact details and keeps crawling. Because heuristic extraction is disabled by default, an LLM failure normally means no jobs are saved from that page. Fallback follow-link expansion is disabled by default so an invalid JSON response cannot flood the queue with weak links:
-
-```text
-RESULT llm_page_analysis_failed_using_configured_fallback error='LLM response was not valid JSON: ...'
-```
-
-Set `llm.thinking_enabled: false` if JSON reliability is poor. Enable `heuristic_extraction.enabled: true` only if you explicitly want fallback extraction.
+Confirm `llm.base_url`, `llm.model`, and `llm.chat_endpoint` match your server.
 
 ### Too many irrelevant jobs
 
 Edit `config/profile.md`, especially:
 
-```text
-Target roles and acceptable titles
-Target role signals
-Avoid and exclude
-```
+- Target roles and acceptable titles
+- Target role signals
+- Avoid and exclude
 
-The guardrails are derived from those sections. You usually should not edit YAML lists or code for this.
+These sections guide the LLM's classification and score. You can also raise `scoring.min_score_to_export` or add employers to `companies.blacklist` in `config/intent.yaml`; Python otherwise preserves the LLM's score.

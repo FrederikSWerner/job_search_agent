@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from .config import JobAgentConfig
 
@@ -13,11 +13,7 @@ _STOP_COMPANY_TOKENS = {
     "deutschland", "germany", "international", "global", "the", "and", "und",
 }
 
-
-@dataclass(frozen=True, slots=True)
-class CompanyMatch:
-    name: str
-    matched_by: str
+FUZZY_MATCH_THRESHOLD = 0.90
 
 
 def normalize_text(value: str) -> str:
@@ -33,6 +29,31 @@ def compact_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", normalize_text(value))
 
 
+def text_similarity(left: str, right: str) -> float:
+    left_norm = normalize_text(left)
+    right_norm = normalize_text(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    return SequenceMatcher(None, left_norm, right_norm).ratio()
+
+
+def company_match_key(value: str) -> str:
+    normalized = normalize_text(value)
+    distinctive = [
+        token for token in normalized.split()
+        if token not in _STOP_COMPANY_TOKENS
+    ]
+    return " ".join(distinctive) or normalized
+
+
+def company_similarity(left: str, right: str) -> float:
+    left_key = company_match_key(left)
+    right_key = company_match_key(right)
+    if not left_key or not right_key:
+        return 0.0
+    return SequenceMatcher(None, left_key, right_key).ratio()
+
+
 def company_aliases(name: str) -> list[str]:
     norm = normalize_text(name)
     if not norm:
@@ -41,9 +62,7 @@ def company_aliases(name: str) -> list[str]:
     tokens = [tok for tok in norm.split() if tok and tok not in _STOP_COMPANY_TOKENS]
 
     aliases: list[str] = [norm]
-    if compact and compact != norm.replace(" ", ""):
-        aliases.append(compact)
-    elif compact:
+    if compact:
         aliases.append(compact)
 
     # The first distinctive token catches common shortened employer names, e.g.
@@ -98,8 +117,14 @@ def company_matches_text(company: str, *values: str) -> bool:
     return False
 
 
-def match_blacklist_company(config: JobAgentConfig, *values: str) -> CompanyMatch | None:
+def matches_blacklisted_company(
+    config: JobAgentConfig,
+    reported_company: str,
+    *values: str,
+) -> bool:
     for company in config.companies.blacklist:
-        if company_matches_text(company, *values):
-            return CompanyMatch(name=company, matched_by="blacklist")
-    return None
+        if company_similarity(company, reported_company) >= FUZZY_MATCH_THRESHOLD:
+            return True
+        if company_matches_text(company, reported_company, *values):
+            return True
+    return False

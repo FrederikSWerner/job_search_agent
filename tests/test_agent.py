@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+
+import pytest
 
 from jobagent.agent import JobAgent
+from jobagent.browser import BrowserFetchError
 from jobagent.db import Database
-from jobagent.models import JobMatch, LinkCandidate, PageDecision, PageSnapshot, QuerySuggestion
-
-
-class AllowAllRobots:
-    def allowed(self, url: str) -> bool:
-        return True
+from jobagent.discover import SEED_RATING
+from jobagent.models import JobMatch, LinkCandidate, LinkClassification, PageDecision, PageSnapshot
 
 
 class FakeBrowser:
-    def __init__(self, pages: dict[str, PageSnapshot]) -> None:
+    def __init__(self, pages: Mapping[str, PageSnapshot | Exception]) -> None:
         self.pages = pages
         self.opened: list[str] = []
 
@@ -25,301 +24,1222 @@ class FakeBrowser:
 
     def fetch(self, url: str) -> PageSnapshot:
         self.opened.append(url)
-        if url not in self.pages:
-            raise KeyError(url)
-        return self.pages[url]
+        result = self.pages[url]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
-class FakeLLM:
+class StaticLLM:
+    def __init__(self, decision: PageDecision) -> None:
+        self.decision = decision
+        self.calls: list[tuple[PageSnapshot, list[dict[str, str]]]] = []
+
+    def classify_links_batch(
+        self,
+        snapshot: PageSnapshot,
+        links_with_context: list[dict[str, str]],
+    ) -> PageDecision:
+        self.calls.append((snapshot, links_with_context))
+        return self.decision
+
+
+class CompleteSkipLLM:
     def __init__(self) -> None:
-        self.query_calls = 0
+        self.calls: list[tuple[PageSnapshot, list[dict[str, str]]]] = []
 
-    def analyze_page(self, snapshot: PageSnapshot, candidate_links, memory_summary: str) -> PageDecision:
-        if snapshot.url == "https://alpha.test/careers":
-            return PageDecision(
-                jobs=[],
-                follow_urls=["https://alpha.test/jobs/procurement-manager"],
-                source_quality=85,
-                source_notes="career index with relevant procurement links",
-            )
-        if snapshot.url == "https://alpha.test/jobs/procurement-manager":
-            return PageDecision(
-                jobs=[
-                    JobMatch(
-                        title="Procurement Manager",
-                        company="Alpha",
-                        location="Munich, Germany",
-                        url=snapshot.url,
-                        fit_score=92,
-                        reason="Procurement role in Munich",
-                        evidence="Procurement Manager",
-                    )
-                ],
-                follow_urls=[],
-                source_quality=95,
-                source_notes="strong direct job detail page",
-            )
-        return PageDecision(jobs=[], follow_urls=[], source_quality=20, source_notes="not useful")
-
-    def generate_queries(self, memory_summary: str, run_summary: str):
-        self.query_calls += 1
-        return [QuerySuggestion(query="Procurement Manager Munich careers", reason="local procurement role discovery")]
+    def classify_links_batch(
+        self,
+        snapshot: PageSnapshot,
+        links_with_context: list[dict[str, str]],
+    ) -> PageDecision:
+        self.calls.append((snapshot, links_with_context))
+        return PageDecision(
+            link_classifications=[
+                LinkClassification(index=int(item["index"]), type="skip")
+                for item in links_with_context
+            ]
+        )
 
 
-class QueryOnlyLLM(FakeLLM):
-    def analyze_page(self, snapshot: PageSnapshot, candidate_links, memory_summary: str) -> PageDecision:
-        return PageDecision(jobs=[], follow_urls=[], source_quality=40, source_notes="search page")
+class RecordingDatabase(Database):
+    def __init__(self, *args, **kwargs) -> None:
+        self.enqueued_ratings: list[tuple[str, int]] = []
+        super().__init__(*args, **kwargs)
+
+    def enqueue(self, url: str, *, rating: int) -> bool:
+        self.enqueued_ratings.append((url, rating))
+        return super().enqueue(url, rating=rating)
 
 
-def test_agent_explores_follow_url_saves_job_and_learns(temp_loaded):
-    temp_loaded.paths.seeds_path.write_text("https://alpha.test/careers\n", encoding="utf-8")
+def snapshot(url: str, *, text: str, links: list[LinkCandidate] | None = None) -> PageSnapshot:
+    return PageSnapshot(
+        url=url,
+        final_url=url,
+        title=url.rsplit("/", 1)[-1],
+        text=text,
+        links=links or [],
+    )
+
+
+def test_agent_saves_job_classified_from_fetched_link_context(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    job_url = "https://alpha.test/jobs/procurement-manager"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
     pages = {
-        "https://alpha.test/careers": PageSnapshot(
-            url="https://alpha.test/careers",
-            final_url="https://alpha.test/careers",
-            title="Alpha Careers",
-            text="Procurement and supplier quality jobs in Munich",
-            links=[LinkCandidate(text="Procurement Manager", url="https://alpha.test/jobs/procurement-manager")],
+        source_url: snapshot(
+            source_url,
+            text="Alpha careers",
+            links=[LinkCandidate(text="Procurement Manager", url=job_url)],
         ),
-        "https://alpha.test/jobs/procurement-manager": PageSnapshot(
-            url="https://alpha.test/jobs/procurement-manager",
-            final_url="https://alpha.test/jobs/procurement-manager",
-            title="Procurement Manager",
-            text="Procurement Manager Munich Germany supplier quality sourcing",
-            links=[],
+        job_url: snapshot(
+            job_url,
+            text="Procurement Manager in Munich. Strategic sourcing responsibilities.",
         ),
     }
-    fake_browser = FakeBrowser(pages)
-    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
-    agent = JobAgent(
-        temp_loaded,
-        db=db,
-        browser_factory=lambda: fake_browser,
-        llm_client=FakeLLM(),
-        robots=AllowAllRobots(),
-    )
-
-    assert agent.run() == 0
-    assert db.count_rows("jobs") == 1
-    job = db.conn.execute("select title, fit_score from jobs").fetchone()
-    assert job["title"] == "Procurement Manager"
-    assert job["fit_score"] == 92
-    learned = db.get_source("alpha.test/jobs")
-    assert learned.score > temp_loaded.config.memory.initial_score
-    assert "https://alpha.test/jobs/procurement-manager" in fake_browser.opened
-    db.close()
-
-
-def test_agent_generates_query_when_frontier_empty(temp_loaded):
-    temp_loaded.paths.seeds_path.write_text("", encoding="utf-8")
-    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
-    fake_browser = FakeBrowser({})
-    fake_llm = FakeLLM()
-    agent = JobAgent(
-        temp_loaded,
-        db=db,
-        browser_factory=lambda: fake_browser,
-        llm_client=fake_llm,
-        robots=AllowAllRobots(),
-    )
-    agent.run()
-    assert fake_llm.query_calls >= 1
-    assert db.count_rows("queries") == 1
-    assert db.queued_count() >= 0
-    db.close()
-
-
-class FailingLLM(FakeLLM):
-    def analyze_page(self, snapshot: PageSnapshot, candidate_links, memory_summary: str) -> PageDecision:
-        raise RuntimeError("simulated local LLM failure")
-
-
-def test_agent_does_not_save_heuristic_job_when_disabled_and_llm_fails(temp_loaded):
-    temp_loaded.paths.seeds_path.write_text("https://jobs.test/procurement-munich\n", encoding="utf-8")
-    pages = {
-        "https://jobs.test/procurement-munich": PageSnapshot(
-            url="https://jobs.test/procurement-munich",
-            final_url="https://jobs.test/procurement-munich",
-            title="Procurement Manager Jobs in München",
-            text="Procurement Manager Jobs in München. Einkauf Beschaffung Supply Chain.",
-            links=[
-                LinkCandidate(
-                    text="Supplier Quality Manager Optics München",
-                    url="https://jobs.test/jobs/supplier-quality-manager-optics-muenchen",
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=92,
+                    title="Procurement Manager",
+                    company="Alpha",
+                    location="Munich",
+                    evidence="Strategic sourcing responsibilities",
+                    reason="Strong procurement fit",
                 )
             ],
         )
-    }
-    fake_browser = FakeBrowser(pages)
+    )
+    browser = FakeBrowser(pages)
     db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    agent = JobAgent(temp_loaded, db=db, browser_factory=lambda: browser, llm_client=llm)
+
+    assert agent.run() == 0
+
+    row = db.conn.execute("select * from jobs").fetchone()
+    assert row["url"] == job_url
+    assert row["title"] == "Procurement Manager"
+    assert row["source_key"] == "alpha.test/careers"
+    assert browser.opened == [source_url, job_url]
+    assert llm.calls[0][1][0]["url"] == job_url
+    assert "Strategic sourcing responsibilities" in llm.calls[0][1][0]["page_context"]
+    assert db.page_status(source_url) is None
+    assert db.page_status(job_url) == "job_listing"
+    db.close()
+
+
+def test_agent_canonicalizes_candidates_and_binds_returned_url(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    job_url = "https://alpha.test/jobs/buyer"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Careers",
+            links=[
+                LinkCandidate(text="Buyer", url=f"{job_url}?utm_source=test"),
+                LinkCandidate(text="Buyer duplicate", url=job_url),
+            ],
+        ),
+        job_url: snapshot(job_url, text="Buyer in Munich"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=80,
+                    title="Buyer",
+                    company="Alpha",
+                    location="Munich",
+                    url="https://invented.test/job",
+                )
+            ],
+        )
+    )
+    browser = FakeBrowser(pages)
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
+    ).run() == 0
+
+    assert db.conn.execute("select url from jobs").fetchone()["url"] == job_url
+    assert browser.opened == [source_url, job_url]
+    db.close()
+
+
+def test_agent_fuzzy_matches_cross_source_and_refreshes_latest_fields(temp_loaded):
+    source_url = "https://beta.test/careers"
+    existing_url = "https://alpha.test/jobs/procurement-manager-old"
+    discovered_url = "https://alpha.test/jobs/procurement-manager-new"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Careers",
+            links=[LinkCandidate(text="Procurement Manager", url=discovered_url)],
+        ),
+        discovered_url: snapshot(discovered_url, text="Senior procurement role in Munich"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=92,
+                    title="Senior Procurement Manger",
+                    company="Siemen SE",
+                    location="Munich",
+                    evidence="New evidence",
+                    reason="Updated fit",
+                )
+            ]
+        )
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    db.save_jobs(
+        [
+            JobMatch(
+                title="Senior Procurement Manager",
+                company="Siemens AG",
+                location="Munich",
+                url=existing_url,
+                original_url=existing_url,
+                fit_score=80,
+                reason="Old fit",
+                evidence="Old evidence",
+            )
+        ],
+        "alpha.test/careers",
+    )
+    db.conn.execute(
+        "update jobs set first_seen_at = 'preserved', last_seen_at = 'old'"
+    )
+    db.conn.commit()
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: FakeBrowser(pages),
+        llm_client=llm,
+    ).run() == 0
+
+    assert db.count_rows("jobs") == 1
+    row = db.conn.execute("select * from jobs").fetchone()
+    assert row["url"] == discovered_url
+    assert row["original_url"] == discovered_url
+    assert row["title"] == "Senior Procurement Manger"
+    assert row["company"] == "Siemen SE"
+    assert row["fit_score"] == 92
+    assert row["reason"] == "Updated fit"
+    assert row["evidence"] == "New evidence"
+    assert row["source_key"] == "beta.test/careers"
+    assert row["first_seen_at"] == "preserved"
+    assert row["last_seen_at"] != "old"
+    db.close()
+
+
+def test_agent_consolidates_fuzzy_duplicates_within_batch(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    first_url = "https://alpha.test/jobs/procurement-manager-a"
+    second_url = "https://alpha.test/jobs/procurement-manager-b"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Careers",
+            links=[
+                LinkCandidate(text="Procurement Manager", url=first_url),
+                LinkCandidate(text="Procurement Manager", url=second_url),
+            ],
+        ),
+        first_url: snapshot(first_url, text="Senior procurement manager in Munich"),
+        second_url: snapshot(second_url, text="Senior procurement manager in Munich"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=85,
+                    title="Senior Procurement Manager",
+                    company="Alpha GmbH",
+                    location="Munich",
+                ),
+                LinkClassification(
+                    index=1,
+                    type="job_listing",
+                    fit_score=90,
+                    title="Senior Procurement Manger",
+                    company="Alpha AG",
+                    location="Munich",
+                ),
+            ]
+        )
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: FakeBrowser(pages),
+        llm_client=llm,
+    ).run() == 0
+
+    assert db.count_rows("jobs") == 1
+    row = db.conn.execute("select * from jobs").fetchone()
+    assert row["url"] == second_url
+    assert row["original_url"] == second_url
+    assert row["fit_score"] == 90
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("title", "company", "location"),
+    [
+        ("Software Engineer", "Alpha AG", "Munich"),
+        ("Senior Procurement Manger", "Beta AG", "Munich"),
+        ("Senior Procurement Manger", "Alpha AG", "Berlin"),
+    ],
+)
+def test_agent_fuzzy_dedup_requires_matching_title_company_and_location(
+    temp_loaded,
+    title,
+    company,
+    location,
+):
+    existing_url = "https://alpha.test/jobs/procurement-manager"
+    discovered_url = "https://alpha.test/jobs/other"
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    db.save_jobs(
+        [
+            JobMatch(
+                title="Senior Procurement Manager",
+                company="Alpha GmbH",
+                location="Munich",
+                url=existing_url,
+                original_url=existing_url,
+                fit_score=80,
+                reason="Fit",
+                evidence="Procurement",
+            )
+        ],
+        "alpha.test/careers",
+    )
     agent = JobAgent(
         temp_loaded,
         db=db,
-        browser_factory=lambda: fake_browser,
-        llm_client=FailingLLM(),
-        robots=AllowAllRobots(),
+        browser_factory=lambda: FakeBrowser({}),
+        llm_client=StaticLLM(PageDecision()),
+    )
+
+    assert agent._clean_and_save_jobs(
+        [
+            JobMatch(
+                title=title,
+                company=company,
+                location=location,
+                url=discovered_url,
+                original_url=discovered_url,
+                fit_score=90,
+                reason="Fit",
+                evidence="Evidence",
+            )
+        ],
+        "alpha.test/careers",
+    ) == 1
+
+    assert db.count_rows("jobs") == 2
+    db.close()
+
+
+def test_agent_fuzzy_dedup_keeps_oldest_row_and_deletes_other_matches(temp_loaded):
+    oldest_url = "https://alpha.test/jobs/procurement-manager-oldest"
+    latest_url = "https://beta.test/jobs/procurement-manager-latest"
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    db.save_jobs(
+        [
+            JobMatch(
+                title="Senior Procurement Manager",
+                company="Alpha GmbH",
+                location="Munich",
+                url=oldest_url,
+                original_url=oldest_url,
+                fit_score=75,
+                reason="Old fit",
+                evidence="Old evidence",
+            )
+        ],
+        "alpha.test/careers",
+    )
+    db.save_jobs(
+        [
+            JobMatch(
+                title="Senior Procurement Manager",
+                company="Alpha AG",
+                location="Munich",
+                url=latest_url,
+                original_url=latest_url,
+                fit_score=80,
+                reason="Duplicate fit",
+                evidence="Duplicate evidence",
+            )
+        ],
+        "beta.test/jobs",
+    )
+    db.conn.execute(
+        "update jobs set first_seen_at = '2024-01-01', last_seen_at = 'oldest-last' "
+        "where url = ?",
+        (oldest_url,),
+    )
+    db.conn.execute(
+        "update jobs set first_seen_at = '2025-01-01', last_seen_at = 'newer-last' "
+        "where url = ?",
+        (latest_url,),
+    )
+    db.conn.commit()
+    agent = JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: FakeBrowser({}),
+        llm_client=StaticLLM(PageDecision()),
+    )
+
+    assert agent._clean_and_save_jobs(
+        [
+            JobMatch(
+                title="Senior Procurement Manger",
+                company="Alpha SE",
+                location="Munich",
+                url=latest_url,
+                original_url="https://search.test/redirect-to-latest",
+                fit_score=95,
+                reason="Latest fit",
+                evidence="Latest evidence",
+            )
+        ],
+        "search.test/results",
+    ) == 1
+
+    assert db.count_rows("jobs") == 1
+    row = db.conn.execute("select * from jobs").fetchone()
+    assert row["url"] == latest_url
+    assert row["original_url"] == "https://search.test/redirect-to-latest"
+    assert row["first_seen_at"] == "2024-01-01"
+    assert row["last_seen_at"] not in {"oldest-last", "newer-last"}
+    assert row["fit_score"] == 95
+    assert row["source_key"] == "search.test/results"
+    db.close()
+
+
+def test_agent_records_structured_top_level_browser_error(temp_loaded):
+    source_url = "https://search.example.test/jobs"
+    final_url = "https://search.example.test/blocked"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    error = BrowserFetchError(
+        kind="http",
+        requested_url=source_url,
+        final_url=final_url,
+        status_code=429,
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: FakeBrowser({source_url: error}),
+        llm_client=StaticLLM(PageDecision()),
+    ).run() == 0
+
+    row = db.conn.execute(
+        "select final_url, status from pages where url = ?", (source_url,)
+    ).fetchone()
+    assert dict(row) == {"final_url": final_url, "status": "error:http_429"}
+    db.close()
+
+
+def test_candidate_browser_error_is_not_sent_to_llm_or_retried_with_source(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    job_url = "https://alpha.test/jobs/buyer"
+    temp_loaded.config.crawler.retry_error_pages = False
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    error = BrowserFetchError(
+        kind="http",
+        requested_url=job_url,
+        final_url=job_url,
+        status_code=503,
+    )
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=99,
+                    title="Invented Buyer",
+                    company="Alpha",
+                    location="Munich",
+                )
+            ],
+        )
+    )
+    browser = FakeBrowser(
+        {
+            source_url: snapshot(
+                source_url,
+                text="Careers",
+                links=[LinkCandidate(text="Buyer", url=job_url)],
+            ),
+            job_url: error,
+        }
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
+    ).run() == 0
+
+    assert llm.calls == []
+    assert db.page_status(source_url) is None
+    assert db.page_status(job_url) == "error:http_503"
+    assert db.count_rows("jobs") == 0
+    assert db.conn.execute(
+        "select status from backlog where url = ?", (source_url,)
+    ).fetchone() is None
+    assert browser.opened == [source_url, job_url]
+    db.close()
+
+    reopened = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    assert reopened.pop_backlog() is None
+    reopened.close()
+
+
+def test_agent_retries_transient_candidate_http_error_only_on_next_run(temp_loaded):
+    first_source = "https://alpha.test/careers"
+    second_source = "https://beta.test/careers"
+    job_url = "https://jobs.test/buyer"
+    temp_loaded.config.crawler.retry_error_pages = True
+    temp_loaded.config.run.backlog_order = "fifo"
+    temp_loaded.paths.seeds_path.write_text(
+        f"{first_source}\n{second_source}\n",
+        encoding="utf-8",
+    )
+    pages = {
+        first_source: snapshot(
+            first_source,
+            text="Alpha careers",
+            links=[LinkCandidate(text="Buyer", url=job_url)],
+        ),
+        second_source: snapshot(
+            second_source,
+            text="Beta careers",
+            links=[LinkCandidate(text="Buyer", url=job_url)],
+        ),
+    }
+    candidate_results = [
+        BrowserFetchError(
+            kind="http",
+            requested_url=job_url,
+            final_url=job_url,
+            status_code=503,
+        ),
+        snapshot(job_url, text="Buyer in Munich"),
+    ]
+
+    class RetryBrowser(FakeBrowser):
+        def fetch(self, url: str) -> PageSnapshot:
+            self.opened.append(url)
+            result = candidate_results.pop(0) if url == job_url else self.pages[url]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=85,
+                    title="Buyer",
+                    company="Example",
+                    location="Munich",
+                )
+            ]
+        )
+    )
+    browser = RetryBrowser(pages)
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    agent = JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
     )
 
     assert agent.run() == 0
+
+    assert browser.opened.count(job_url) == 1
+    assert llm.calls == []
+    assert db.page_status(job_url) == "error:http_503"
+    assert db.count_rows("jobs") == 0
+
+    assert agent.run() == 0
+
+    assert browser.opened.count(job_url) == 2
+    assert len(llm.calls) == 1
+    assert db.page_status(job_url) == "job_listing"
+    assert db.count_rows("jobs") == 1
+    db.close()
+
+
+def test_agent_sends_only_successfully_fetched_candidates_to_llm(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    failed_url = "https://alpha.test/jobs/unavailable"
+    job_url = "https://alpha.test/jobs/buyer"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=85,
+                    title="Buyer",
+                    company="Alpha",
+                    location="Munich",
+                )
+            ],
+        )
+    )
+    browser = FakeBrowser(
+        {
+            source_url: snapshot(
+                source_url,
+                text="Careers",
+                links=[
+                    LinkCandidate(text="Unavailable", url=failed_url),
+                    LinkCandidate(text="Buyer", url=job_url),
+                ],
+            ),
+            failed_url: RuntimeError("navigation failed"),
+            job_url: snapshot(job_url, text="Buyer in Munich"),
+        }
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
+    ).run() == 0
+
+    assert len(llm.calls) == 1
+    assert len(llm.calls[0][1]) == 1
+    llm_link = llm.calls[0][1][0]
+    assert llm_link["index"] == "0"
+    assert llm_link["text"] == "Buyer"
+    assert llm_link["url"] == job_url
+    assert "Buyer in Munich" in llm_link["page_context"]
+    assert db.conn.execute("select url from jobs").fetchone()["url"] == job_url
+    assert db.page_status(source_url) is None
+    assert db.page_status(failed_url) == "error:RuntimeError"
+    assert db.page_status(job_url) == "job_listing"
+    assert browser.opened == [source_url, failed_url, job_url]
+    db.close()
+
+
+def test_agent_refills_llm_batch_after_candidates_are_dropped(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    visited_url = "https://alpha.test/jobs/visited"
+    failed_url = "https://alpha.test/jobs/unavailable"
+    rejected_url = "https://alpha.test/jobs/redirected"
+    valid_urls = [f"https://alpha.test/jobs/valid-{index}" for index in range(4)]
+    temp_loaded.config.crawler.batch_size_for_llm = 3
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+
+    candidate_urls = [
+        visited_url,
+        valid_urls[0],
+        failed_url,
+        valid_urls[1],
+        rejected_url,
+        valid_urls[2],
+        valid_urls[3],
+    ]
+    pages: dict[str, PageSnapshot | Exception] = {
+        source_url: snapshot(
+            source_url,
+            text="Careers",
+            links=[
+                LinkCandidate(text=url.rsplit("/", 1)[-1], url=url)
+                for url in candidate_urls
+            ],
+        ),
+        failed_url: RuntimeError("navigation failed"),
+        rejected_url: PageSnapshot(
+            url=rejected_url,
+            final_url="https://facebook.com/jobs/blocked",
+            title="Blocked redirect",
+            text="Not a usable destination",
+        ),
+    }
+    pages.update({url: snapshot(url, text=f"Context for {url}") for url in valid_urls})
+
+    llm = CompleteSkipLLM()
+    browser = FakeBrowser(pages)
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    db.record_page(visited_url, visited_url, "skip")
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
+    ).run() == 0
+
+    assert [
+        [item["url"] for item in links]
+        for _, links in llm.calls
+    ] == [valid_urls[:3], valid_urls[3:]]
+    assert [
+        [item["index"] for item in links]
+        for _, links in llm.calls
+    ] == [["0", "1", "2"], ["0"]]
+    assert browser.opened == [
+        source_url,
+        valid_urls[0],
+        failed_url,
+        valid_urls[1],
+        rejected_url,
+        valid_urls[2],
+        valid_urls[3],
+    ]
+    assert db.page_status(source_url) is None
+    assert db.page_status(visited_url) == "skip"
+    assert db.page_status(failed_url) == "error:RuntimeError"
+    assert db.page_status(rejected_url) is None
+    assert all(db.page_status(url) == "skip" for url in valid_urls)
     assert db.count_rows("jobs") == 0
     db.close()
 
 
-def test_agent_can_save_heuristic_job_when_explicitly_enabled_and_llm_fails(temp_loaded):
-    temp_loaded.config.heuristic_extraction.enabled = True
-    temp_loaded.config.heuristic_extraction.suppress_link_jobs_on_index_pages = False
-    temp_loaded.config.job_validation.require_loaded_job_detail_page = False
-    temp_loaded.paths.seeds_path.write_text("https://jobs.test/procurement-munich\n", encoding="utf-8")
+def test_agent_fetches_candidate_only_once_across_sources(temp_loaded):
+    first_source = "https://alpha.test/careers"
+    second_source = "https://beta.test/careers"
+    job_url = "https://jobs.test/buyer"
+    temp_loaded.paths.seeds_path.write_text(
+        f"{first_source}\n{second_source}\n",
+        encoding="utf-8",
+    )
     pages = {
-        "https://jobs.test/procurement-munich": PageSnapshot(
-            url="https://jobs.test/procurement-munich",
-            final_url="https://jobs.test/procurement-munich",
-            title="Procurement Manager Jobs in München",
-            text="Procurement Manager Jobs in München. Einkauf Beschaffung Supply Chain.",
-            links=[
-                LinkCandidate(
-                    text="Supplier Quality Manager Optics München",
-                    url="https://jobs.test/jobs/supplier-quality-manager-optics-muenchen",
-                )
-            ],
-        )
+        first_source: snapshot(
+            first_source,
+            text="Alpha careers",
+            links=[LinkCandidate(text="Buyer", url=job_url)],
+        ),
+        second_source: snapshot(
+            second_source,
+            text="Beta careers",
+            links=[LinkCandidate(text="Buyer", url=job_url)],
+        ),
+        job_url: snapshot(job_url, text="Buyer in Munich"),
     }
-    fake_browser = FakeBrowser(pages)
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(index=0, type="skip", reason="Not a target role")
+            ]
+        )
+    )
+    browser = FakeBrowser(pages)
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
+    ).run() == 0
+
+    assert browser.opened.count(job_url) == 1
+    assert len(llm.calls) == 1
+    assert db.page_status(job_url) == "skip"
+    assert db.count_rows("backlog") == 0
+    db.close()
+
+
+def test_agent_reconsiders_unpersisted_explore_candidate_each_time(temp_loaded):
+    first_source = "https://alpha.test/careers"
+    second_source = "https://beta.test/careers"
+    explore_url = "https://jobs.test/openings"
+    temp_loaded.config.exploration.enabled = False
+    temp_loaded.config.run.backlog_order = "fifo"
+    temp_loaded.paths.seeds_path.write_text(
+        f"{first_source}\n{second_source}\n",
+        encoding="utf-8",
+    )
+    pages = {
+        first_source: snapshot(
+            first_source,
+            text="Alpha careers",
+            links=[LinkCandidate(text="Open roles", url=explore_url)],
+        ),
+        second_source: snapshot(
+            second_source,
+            text="Beta careers",
+            links=[LinkCandidate(text="Open roles", url=explore_url)],
+        ),
+        explore_url: snapshot(explore_url, text="Current openings"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(index=0, type="explore", fit_score=70)
+            ]
+        )
+    )
+    browser = FakeBrowser(pages)
     db = Database(temp_loaded.paths.database_path, temp_loaded.config)
     agent = JobAgent(
         temp_loaded,
         db=db,
-        browser_factory=lambda: fake_browser,
-        llm_client=FailingLLM(),
-        robots=AllowAllRobots(),
+        browser_factory=lambda: browser,
+        llm_client=llm,
     )
 
     assert agent.run() == 0
-    assert db.count_rows("jobs") == 1
-    job = db.conn.execute("select title, reason from jobs").fetchone()
-    assert "Supplier Quality Manager" in job["title"]
-    assert "Heuristic" in job["reason"]
+    assert browser.opened.count(explore_url) == 2
+    assert db.page_status(explore_url) is None
+
+    assert agent.run() == 0
+    assert browser.opened.count(explore_url) == 4
+    assert len(llm.calls) == 4
+    assert db.page_status(explore_url) is None
     db.close()
 
-class NoisyScoringLLM(FakeLLM):
-    def analyze_page(self, snapshot: PageSnapshot, candidate_links, memory_summary: str) -> PageDecision:
-        return PageDecision(
-            jobs=[
-                JobMatch(
-                    title="Sales Representative Optics",
-                    company="Noise GmbH",
-                    location="Munich, Germany",
-                    url="https://noise.test/jobs/sales-representative-optics",
-                    fit_score=78,
-                    reason="LLM over-scored a sales role because optics was mentioned",
-                    evidence="Sales Representative Optics",
-                ),
-                JobMatch(
-                    title="Electronics Engineer Laser Systems",
-                    company="Noise GmbH",
-                    location="München",
-                    url="https://noise.test/jobs/electronics-engineer-laser",
-                    fit_score=81,
-                    reason="LLM over-scored an engineering role because laser was mentioned",
-                    evidence="Electronics Engineer Laser Systems",
-                ),
-                JobMatch(
-                    title="Supplier Quality Manager Optical Components",
-                    company="Good GmbH",
-                    location="München",
-                    url="https://noise.test/jobs/supplier-quality-manager-optics",
-                    fit_score=86,
-                    reason="Supplier quality management for optical components in München",
-                    evidence="Supplier Quality Manager Optical Components",
-                ),
-            ],
-            follow_urls=[],
-            source_quality=80,
-            source_notes="mixed quality page",
-        )
 
-
-def test_agent_score_guard_filters_noisy_llm_matches(temp_loaded):
-    temp_loaded.config.job_validation.require_loaded_job_detail_page = False
-    temp_loaded.paths.seeds_path.write_text("https://noise.test/jobs\n", encoding="utf-8")
+def test_agent_drops_out_of_range_classification_index(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    job_url = "https://alpha.test/jobs/buyer"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
     pages = {
-        "https://noise.test/jobs": PageSnapshot(
-            url="https://noise.test/jobs",
-            final_url="https://noise.test/jobs",
-            title="Jobs",
-            text="Supplier Quality Manager Optical Components Munich. Sales Representative Optics. Electronics Engineer Laser Systems.",
-            links=[
-                LinkCandidate(text="Sales Representative Optics", url="https://noise.test/jobs/sales-representative-optics"),
-                LinkCandidate(text="Electronics Engineer Laser Systems", url="https://noise.test/jobs/electronics-engineer-laser"),
-                LinkCandidate(text="Supplier Quality Manager Optical Components", url="https://noise.test/jobs/supplier-quality-manager-optics"),
+        source_url: snapshot(
+            source_url,
+            text="Careers",
+            links=[LinkCandidate(text="Buyer", url=job_url)],
+        ),
+        job_url: snapshot(job_url, text="Buyer in Munich"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=9,
+                    type="job_listing",
+                    fit_score=80,
+                    title="Buyer",
+                    company="Alpha",
+                    location="Munich",
+                )
             ],
         )
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: FakeBrowser(pages),
+        llm_client=llm,
+    ).run() == 0
+    assert db.count_rows("jobs") == 0
+    db.close()
+
+
+def test_agent_applies_export_score_threshold(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    low_url = "https://alpha.test/jobs/low-fit"
+    accepted_url = "https://alpha.test/jobs/accepted-fit"
+    temp_loaded.config.scoring.min_score_to_export = 80
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Alpha careers",
+            links=[
+                LinkCandidate(text="Low fit", url=low_url),
+                LinkCandidate(text="Accepted fit", url=accepted_url),
+            ],
+        ),
+        low_url: snapshot(low_url, text="A weakly related role"),
+        accepted_url: snapshot(accepted_url, text="A matching procurement role"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=79,
+                    title="Low Fit Role",
+                    company="Alpha",
+                    location="Munich",
+                ),
+                LinkClassification(
+                    index=1,
+                    type="job_listing",
+                    fit_score=80,
+                    title="Accepted Role",
+                    company="Alpha",
+                    location="Munich",
+                ),
+            ],
+        )
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    agent = JobAgent(temp_loaded, db=db, browser_factory=lambda: FakeBrowser(pages), llm_client=llm)
+
+    assert agent.run() == 0
+    rows = db.conn.execute("select url, fit_score from jobs").fetchall()
+    assert [(row["url"], row["fit_score"]) for row in rows] == [(accepted_url, 80)]
+    assert db.page_status(low_url) == "job_listing"
+    assert db.page_status(accepted_url) == "job_listing"
+    db.close()
+
+
+def test_agent_drops_jobs_from_blacklisted_companies(temp_loaded):
+    source_url = "https://example.test/careers"
+    job_url = "https://example.test/jobs/buyer"
+    temp_loaded.config.companies.blacklist = ["BadCo"]
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Careers",
+            links=[LinkCandidate(text="Buyer", url=job_url)],
+        ),
+        job_url: snapshot(job_url, text="Buyer role in Munich"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=91,
+                    title="Buyer",
+                    company="BadCo GmbH",
+                    location="Munich",
+                )
+            ],
+        )
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    agent = JobAgent(temp_loaded, db=db, browser_factory=lambda: FakeBrowser(pages), llm_client=llm)
+
+    assert agent.run() == 0
+    assert db.count_rows("jobs") == 0
+    assert db.page_status(job_url) == "job_listing"
+    db.close()
+
+
+@pytest.mark.parametrize("exploration_enabled", [False, True])
+def test_agent_exploration_flag_controls_explore_enqueue(temp_loaded, exploration_enabled):
+    source_url = "https://alpha.test/start"
+    explore_url = "https://alpha.test/jobs"
+    temp_loaded.config.exploration.enabled = exploration_enabled
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Alpha",
+            links=[LinkCandidate(text="Open jobs", url=explore_url)],
+        ),
+        explore_url: snapshot(explore_url, text="Open positions"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="explore",
+                    fit_score=73,
+                    reason="Relevant job index",
+                )
+            ],
+        )
+    )
+    browser = FakeBrowser(pages)
+    db = RecordingDatabase(temp_loaded.paths.database_path, temp_loaded.config)
+    agent = JobAgent(temp_loaded, db=db, browser_factory=lambda: browser, llm_client=llm)
+
+    assert agent.run() == 0
+    row = db.conn.execute("select status from backlog where url = ?", (explore_url,)).fetchone()
+    assert row is None
+    assert db.page_status(explore_url) is None
+    assert browser.opened.count(explore_url) == (2 if exploration_enabled else 1)
+    assert db.enqueued_ratings == (
+        [(source_url, SEED_RATING), (explore_url, 73)]
+        if exploration_enabled
+        else [(source_url, SEED_RATING)]
+    )
+    db.close()
+
+
+def test_agent_applies_explore_score_threshold(temp_loaded):
+    source_url = "https://alpha.test/start"
+    below_url = "https://alpha.test/jobs/uncertain"
+    accepted_url = "https://alpha.test/jobs/relevant"
+    temp_loaded.config.scoring.min_score_to_explore = 40
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Alpha",
+            links=[
+                LinkCandidate(text="Uncertain jobs", url=below_url),
+                LinkCandidate(text="Relevant jobs", url=accepted_url),
+            ],
+        ),
+        below_url: snapshot(below_url, text="Uncertain open positions"),
+        accepted_url: snapshot(accepted_url, text="Relevant open positions"),
+    }
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="explore",
+                    fit_score=39,
+                    reason="Below the exploration threshold",
+                ),
+                LinkClassification(
+                    index=1,
+                    type="explore",
+                    fit_score=40,
+                    reason="At the exploration threshold",
+                ),
+            ]
+        )
+    )
+    browser = FakeBrowser(pages)
+    db = RecordingDatabase(temp_loaded.paths.database_path, temp_loaded.config)
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
+    ).run() == 0
+
+    assert db.enqueued_ratings == [
+        (source_url, SEED_RATING),
+        (accepted_url, 40),
+    ]
+    assert browser.opened.count(below_url) == 1
+    assert browser.opened.count(accepted_url) == 2
+    assert db.count_rows("backlog") == 0
+    db.close()
+
+
+def test_agent_requeues_seed_already_recorded_in_pages(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {source_url: snapshot(source_url, text="Careers")}
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    db.record_page(source_url, source_url, "skip")
+
+    first_browser = FakeBrowser(pages)
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: first_browser,
+        llm_client=StaticLLM(PageDecision()),
+    ).run() == 0
+    assert db.page_status(source_url) == "skip"
+
+    second_browser = FakeBrowser(pages)
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: second_browser,
+        llm_client=StaticLLM(PageDecision()),
+    ).run() == 0
+
+    assert first_browser.opened == [source_url]
+    assert second_browser.opened == [source_url]
+    db.close()
+
+
+class UnavailableLLM:
+    def health_check(self):
+        return False, "ConnectionError: connection refused"
+
+    def classify_links_batch(self, snapshot, links_with_context):
+        raise AssertionError("classification must not run")
+
+
+def test_agent_stops_before_browsing_when_llm_unavailable(temp_loaded):
+    temp_loaded.paths.seeds_path.write_text("https://alpha.test/careers\n", encoding="utf-8")
+    temp_loaded.config.run.reset_pages_on_start = True
+    browser = FakeBrowser({})
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    db.record_page("https://pages.test/existing", "https://pages.test/existing", "skip")
+    agent = JobAgent(temp_loaded, db=db, browser_factory=lambda: browser, llm_client=UnavailableLLM())
+
+    assert agent.run() == 2
+    assert browser.opened == []
+    assert db.queued_count() == 0
+    assert db.page_status("https://pages.test/existing") == "skip"
+    db.close()
+
+
+def test_agent_resets_pages_before_candidate_checks(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    job_url = "https://alpha.test/jobs/buyer"
+    temp_loaded.config.run.reset_pages_on_start = True
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    browser = FakeBrowser(
+        {
+            source_url: snapshot(
+                source_url,
+                text="Careers",
+                links=[LinkCandidate(text="Buyer", url=job_url)],
+            ),
+            job_url: snapshot(job_url, text="Buyer in Munich"),
+        }
+    )
+    llm = StaticLLM(
+        PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=85,
+                    title="Buyer",
+                    company="Alpha",
+                    location="Munich",
+                )
+            ]
+        )
+    )
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    db.record_page(job_url, job_url, "skip")
+
+    assert JobAgent(
+        temp_loaded,
+        db=db,
+        browser_factory=lambda: browser,
+        llm_client=llm,
+    ).run() == 0
+
+    assert browser.opened == [source_url, job_url]
+    assert db.page_status(job_url) == "job_listing"
+    assert db.count_rows("jobs") == 1
+    db.close()
+
+
+class FailingLLM:
+    def classify_links_batch(self, snapshot, links_with_context):
+        raise RuntimeError("simulated local LLM failure")
+
+
+def test_agent_records_generic_midrun_llm_failure_without_saving(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    job_url = "https://alpha.test/jobs/procurement-manager"
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Procurement jobs",
+            links=[LinkCandidate(text="Procurement Manager", url=job_url)],
+        ),
+        job_url: snapshot(job_url, text="Procurement Manager in Munich"),
+    }
+    browser = FakeBrowser(pages)
+    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
+    agent = JobAgent(temp_loaded, db=db, browser_factory=lambda: browser, llm_client=FailingLLM())
+
+    assert agent.run() == 0
+    assert db.count_rows("jobs") == 0
+    assert db.page_status(source_url) == "error:RuntimeError"
+    assert db.page_status(job_url) is None
+    assert db.queued_count() == 0
+    assert db.conn.execute(
+        "select status from backlog where url = ?", (source_url,)
+    ).fetchone()["status"] == "error"
+    assert browser.opened == [source_url, job_url]
+    db.close()
+
+
+class SecondBatchFailingLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def classify_links_batch(self, snapshot, links_with_context):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("second batch failed")
+        return PageDecision(
+            link_classifications=[
+                LinkClassification(
+                    index=0,
+                    type="job_listing",
+                    fit_score=80,
+                    title="Buyer",
+                    company="Alpha",
+                    location="Munich",
+                )
+            ],
+        )
+
+
+def test_later_batch_failure_keeps_committed_job_in_run_stats(temp_loaded):
+    source_url = "https://alpha.test/careers"
+    first_url = "https://alpha.test/jobs/buyer"
+    second_url = "https://alpha.test/jobs/manager"
+    temp_loaded.config.crawler.batch_size_for_llm = 1
+    temp_loaded.paths.seeds_path.write_text(f"{source_url}\n", encoding="utf-8")
+    pages = {
+        source_url: snapshot(
+            source_url,
+            text="Careers",
+            links=[
+                LinkCandidate(text="Buyer", url=first_url),
+                LinkCandidate(text="Manager", url=second_url),
+            ],
+        ),
+        first_url: snapshot(first_url, text="Buyer in Munich"),
+        second_url: snapshot(second_url, text="Manager in Munich"),
     }
     db = Database(temp_loaded.paths.database_path, temp_loaded.config)
     agent = JobAgent(
         temp_loaded,
         db=db,
         browser_factory=lambda: FakeBrowser(pages),
-        llm_client=NoisyScoringLLM(),
-        robots=AllowAllRobots(),
+        llm_client=SecondBatchFailingLLM(),
     )
+
     assert agent.run() == 0
-    rows = db.conn.execute("select title, fit_score, score_source, score_basis from jobs order by fit_score desc").fetchall()
-    assert [row["title"] for row in rows] == ["Supplier Quality Manager Optical Components"]
-    assert rows[0]["fit_score"] == 86
-    assert rows[0]["score_source"] == "llm"
-    assert "target role signal" in rows[0]["score_basis"]
-    db.close()
-
-
-class UnavailableLLM(FakeLLM):
-    def health_check(self):
-        return False, "ConnectionError: connection refused"
-
-
-def test_agent_stops_before_browsing_when_llm_unavailable(temp_loaded):
-    temp_loaded.paths.seeds_path.write_text("https://alpha.test/careers\n", encoding="utf-8")
-    fake_browser = FakeBrowser({})
-    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
-    agent = JobAgent(
-        temp_loaded,
-        db=db,
-        browser_factory=lambda: fake_browser,
-        llm_client=UnavailableLLM(),
-        robots=AllowAllRobots(),
-    )
-    assert agent.run() == 2
-    assert fake_browser.opened == []
-    db.close()
-
-
-class ConnectionFailingLLM(FakeLLM):
-    def analyze_page(self, snapshot: PageSnapshot, candidate_links, memory_summary: str) -> PageDecision:
-        raise ConnectionError("Failed to establish a new connection: [Errno 111] Connection refused")
-
-
-def test_agent_stops_on_midrun_llm_connection_error_without_expanding_queue(temp_loaded):
-    temp_loaded.config.llm.require_available_on_start = False
-    temp_loaded.paths.seeds_path.write_text("https://alpha.test/careers\n", encoding="utf-8")
-    pages = {
-        "https://alpha.test/careers": PageSnapshot(
-            url="https://alpha.test/careers",
-            final_url="https://alpha.test/careers",
-            title="Alpha Careers",
-            text="Procurement jobs",
-            links=[LinkCandidate(text="Procurement Manager", url="https://alpha.test/jobs/procurement-manager")],
-        )
-    }
-    fake_browser = FakeBrowser(pages)
-    db = Database(temp_loaded.paths.database_path, temp_loaded.config)
-    agent = JobAgent(
-        temp_loaded,
-        db=db,
-        browser_factory=lambda: fake_browser,
-        llm_client=ConnectionFailingLLM(),
-        robots=AllowAllRobots(),
-    )
-    assert agent.run() == 0
-    assert fake_browser.opened == ["https://alpha.test/careers"]
-    assert db.queued_count() == 0
+    assert db.count_rows("jobs") == 1
+    assert agent.reporter.stats.jobs_saved == 1
+    assert db.page_status(source_url) == "error:RuntimeError"
+    assert db.page_status(first_url) == "job_listing"
+    assert db.page_status(second_url) is None
     db.close()

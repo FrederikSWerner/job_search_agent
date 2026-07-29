@@ -2,7 +2,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
+
+
+def unique_terms(values: list[str]) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        term = str(value).strip()
+        key = term.casefold()
+        if term and key not in seen:
+            seen.add(key)
+            terms.append(term)
+    return terms
 
 
 @dataclass(slots=True)
@@ -18,20 +29,6 @@ class ProfileKnowledge:
     positive_terms: list[str] = field(default_factory=list)
     avoid_terms: list[str] = field(default_factory=list)
     search_terms: list[str] = field(default_factory=list)
-
-
-def unique_terms(values: Iterable[str]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        term = re.sub(r"\s+", " ", str(value or "")).strip(" \t\n\r-–—:;,.•")
-        if not term:
-            continue
-        key = term.casefold()
-        if key not in seen:
-            seen.add(key)
-            out.append(term)
-    return out
 
 
 def _section_key(line: str) -> str:
@@ -112,35 +109,12 @@ def extract_profile_knowledge(profile_text: str) -> ProfileKnowledge:
         elif bucket == "positive":
             knowledge.positive_terms.extend(terms)
         else:
-            # Neutral bullets are useful search context but should not become score guardrails.
+            # Neutral bullets are useful search and text-relevance context.
             knowledge.search_terms.extend(terms)
 
-    # Useful short signals derived from multi-word target roles.
-    derived_role_signals: list[str] = []
-    for role in knowledge.target_roles:
-        role_l = role.casefold()
-        for token in (
-            "procurement", "purchasing", "buyer", "sourcing", "supply chain",
-            "supplier quality", "supplier development", "supplier management",
-            "category", "commodity", "einkauf", "einkäufer", "einkaeufer",
-            "beschaffung", "lieferantenqualität", "lieferantenqualitaet",
-            "lieferantenentwicklung", "lieferantenmanagement", "warengruppe",
-        ):
-            if token in role_l:
-                derived_role_signals.append(token)
-
     knowledge.target_roles = unique_terms(knowledge.target_roles)
-    knowledge.role_signals = unique_terms(knowledge.role_signals + derived_role_signals)
+    knowledge.role_signals = unique_terms(knowledge.role_signals)
     knowledge.positive_terms = unique_terms(knowledge.positive_terms + knowledge.search_terms)
     knowledge.avoid_terms = unique_terms(knowledge.avoid_terms)
     knowledge.search_terms = unique_terms(knowledge.search_terms + knowledge.target_roles + knowledge.positive_terms)
     return knowledge
-
-
-def regexes_from_terms(terms: Iterable[str]) -> list[str]:
-    patterns: list[str] = []
-    for term in unique_terms(terms):
-        escaped = re.escape(term).replace(r"\ ", r"[\s_-]+")
-        if escaped:
-            patterns.append(rf"(?i)\b{escaped}\b")
-    return patterns

@@ -2,100 +2,64 @@ page_analysis_system: |-
   Return valid JSON only. You are a conservative job-detail extractor and evaluator for public career pages and public job portals. Do not invent jobs, companies, locations, URLs, scores, or facts. Do not use markdown.
 
 page_analysis_user: |-
-  $no_think_prefix
   Candidate profile and scoring preferences:
   $profile
 
   Target area: $local_area
-  Location policy: $location_policy
-  Languages to understand: $target_languages
-  Language policy: $language_policy
-  Learned source memory: $memory_summary
+  Jobs are persisted only when fit_score is at least $min_score_to_export.
 
-  Page actually loaded by the browser:
+  Source page where the candidate links were discovered:
   Requested URL: $url
   Final URL: $final_url
   HTTP status: $http_status_code
   Page title: $title
 
-  Visible text from the loaded page:
-  $text
+  Candidate links with their fetched page context. For each link, you are provided:
+  - index: position in the current link batch
+  - text: the clickable link text
+  - original_url: the discovered URL before redirects
+  - url: the final destination URL after redirects
+  - page_title: the title of the fetched destination page
+  - page_context: the first several thousand characters of text extracted from the fetched destination page
 
-  Candidate links found on this loaded page. Candidate links are for exploration only unless explicitly put into follow_urls:
-  $candidate_links_json
+  Links to evaluate:
+  $links_with_context
+
+  Classification Guidance:
+  - Classify each link independently using only that link's text, original_url, url, page_title, and page_context. Do not use another link's context to fill in missing job details.
+
+  Link classification types:
+  - job_listing: The destination page is dedicated to one specific job and contains its actual title, employer, location, and enough description such as responsibilities, requirements, tasks, profile, benefits, or application context. Include fit_score, title, company, location, evidence, and reason.
+  - explore: The destination is useful for future browsing because it contains links to potentially relevant job postings, including search results, job overviews, and company careers pages. Include fit_score and reason. For this type, fit_score is the 0-100 likelihood that browsing through this URL will reveal at least one suitable job for the candidate in the target area. Use skip instead when the URL is not genuinely useful for that search.
+  - skip: The destination is not useful (e.g., footer, cookie policy, login, legal, generic page, different search area, not relevant for searches for the target role). Also use "skip" if page_context is empty. fit_score = 0.
 
   Return JSON only with this exact shape:
   {
-    "jobs": [
-      {
-        "title": "exact original job title from this loaded detail page",
-        "company": "company if visible, else empty string",
-        "location": "job location if visible, else empty string",
-        "posting_language": "German, English, Mixed, or Unknown",
-        "url": "Final URL of this loaded page, only when this loaded page is the concrete job detail page",
-        "fit_score": 0,
-        "score_basis": "short score explanation grounded in the profile and the concrete posting",
-        "reason": "one concise reason",
-        "evidence": "short phrase from this loaded page proving this is a real current job posting"
-      }
-    ],
-    "follow_urls": ["absolute URL copied from Candidate links"],
-    "source_quality": 0,
-    "source_notes": "concise source-quality note"
+    "link_classifications": [
+      {"index": 0, "type": "job_listing", "fit_score": 85, "title": "Example Target Role", "company": "Example Corp", "location": "Target City", "evidence": "Concrete role evidence", "reason": "Matches target criteria"},
+      {"index": 1, "type": "explore", "fit_score": 82, "reason": "Target-area careers page with relevant roles"},
+      {"index": 2, "type": "skip", "fit_score": 0, "reason": "Example Reason"}
+    ]
   }
 
-  Extraction gate:
-  - Extract jobs only if the page actually loaded by the browser is a concrete job-detail page.
-  - The loaded page must show the specific role details itself: actual job title, employer, location, and enough description such as responsibilities, requirements, tasks, profile, benefits, or application context.
-  - If this loaded page is a search result, overview page, listing page, city page, category page, filter page, career homepage, location page, department page, or page with only job cards/snippets, return "jobs": [] even when the cards look relevant.
-  - On overview/listing/search pages, use follow_urls to request promising job-detail links. Do not extract data from the overview page.
-  - Do not extract initiative/speculative/general applications, talent pools, login/application forms, or pages whose title is only a city, department, category, or navigation label.
+  IMPORTANT: Return a link_classifications entry for EVERY link provided. Never return full URLs in this field. The index corresponds to the position in the current batch above. If all links are skip, return an array of skip entries.
 
-  URL rules:
-  - For a valid job, set url to the Final URL of the loaded page.
-  - Do not use a Candidate link as the job URL. Candidate links are only for follow_urls so the agent can load the detail page later.
-  - If the Final URL looks like a generic search/listing/filter page, return no jobs.
-  - follow_urls max 8, copied exactly from Candidate links. Prefer target-area and role-relevant URLs that look like detail pages. Do not follow URLs visibly pointing to cities outside the configured radius.
-
-  Fit scoring policy:
+  Job fit scoring policy (only for job_listing entries):
   - Use the candidate profile as the source of truth for target roles, exclusions, expertise, industry preferences, and seniority. Be critical during this evaluation.
-  - Score the concrete job on the loaded detail page, not the employer brand, search snippet, or general industry.
+  - Score the concrete job, not the employer brand, search snippet, or general industry.
   - 90-100: exact target-role fit, clear fit for given background and seniority information, directly at target location, strong expertise and relevant industries fit, and valid target-area or explicitly accepted remote location.
   - 75-89: strong target-role with partial expertise or relevant industries fit, close to target location.
   - 60-74: plausible target-role fit but weak expertise or relevant industries fit.
   - 45-59: weak or uncertain fit for target-role, expertise and relevant industries.
-  - 0-44: wrong role, excluded role, unclear role, wrong location, initiative/talent-pool/general application, listing page, overview page, or insufficient evidence.
+  - 0-44: wrong role, excluded role, unclear role, wrong location, initiative/talent-pool/general application, or insufficient evidence.
   - A role excluded by the profile must score below 45 even if the company, city, or industry looks attractive.
   - A role without a clear target-role signal from the profile must score below 45.
-  - A non-remote job outside the configured target area radius must score below 45.
+  - A non-remote job outside the target-area policy in the candidate profile must score below 45.
   - Broad-only locations are insufficient for non-remote jobs unless the posting explicitly supports remote work in the accepted country.
 
-query_generation_system: |-
-  Return valid JSON only. Generate public web-search queries for discovering job-detail pages, company career pages, and job-portal result pages from the candidate profile. Do not generate URLs or markdown.
-
-query_generation_user: |-
-  $no_think_prefix
-  Candidate profile and search preferences:
-  $profile
-
-  Target area: $local_area
-  Location policy: $location_policy
-  Languages to understand: $target_languages
-  Learned source memory: $memory_summary
-  Recent run summary: $run_summary
-
-  Generate fresh queries that discover public company career pages, public job-portal result pages, or concrete job-detail pages matching the profile.
-
-  Return JSON only with this exact shape:
-  {
-    "queries": [
-      {"query": "search query text", "reason": "why this query is worth trying"}
-    ]
-  }
-
-  Rules:
-  - Produce at most 5 queries.
-  - Use target-role, expertise, industry, and location terms from the profile.
-  - Keep queries centered on the configured target area and radius. Do not generate searches for other cities.
-  - Prefer precise local queries over broad country-wide queries unless the profile accepts remote work.
-  - Avoid login-only/private sources and repeated weak sources from source memory.
+  Explore rating policy (only for explore entries):
+  - 90-100: a focused target-area result or careers page with strong evidence of relevant open roles.
+  - 70-89: a relevant job overview or careers page likely to lead to suitable target-area roles.
+  - 40-69: potentially useful, but role relevance, active openings, or target-area coverage is uncertain.
+  - 1-39: weak chance of finding a suitable target-area role; normally classify as skip instead.
+  - 0: no useful chance; classify as skip.
